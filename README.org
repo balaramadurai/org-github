@@ -1,0 +1,191 @@
+#+TITLE: org-github
+#+AUTHOR: Bala Ramadurai
+#+OPTIONS: toc:2 num:nil
+
+* org-github
+
+GitHub Issues/PRs integration with Org-mode and time tracking.
+
+** Features
+
+- Fetch GitHub issues and PRs into Org headings with full metadata
+- Clock in/out on issues with optional time logging to GitHub
+- Sync issue/PR states between GitHub and Org-mode
+- Create issues from Org headings
+- Add comments to issues/PRs from Emacs
+- Extract and estimate time from git commit history
+- PARA-compatible file organization via repo-to-file mappings
+
+** Requirements
+
+- Emacs 27.1 or later
+- Org-mode 9.0 or later
+- [[https://cli.github.com/][GitHub CLI (gh)]] installed and authenticated
+
+** Installation
+
+*** straight.el
+
+#+begin_src emacs-lisp
+(use-package org-github
+  :straight (org-github :type git :host github :repo "balaramadurai/org-github")
+  :defer t
+  :commands (org-github-download-issues
+             org-github-download-prs
+             org-github-download-all
+             org-github-sync-repos
+             org-github-full-sync
+             org-github-clock-in
+             org-github-clock-out-and-log)
+  :custom
+  (org-github-org-file "~/Documents/github.org")
+  (org-github-default-repos '("owner/repo")))
+#+end_src
+
+*** Manual Installation
+
+1. Clone this repository
+2. Add to your load-path:
+   #+begin_src emacs-lisp
+   (add-to-list 'load-path "/path/to/org-github")
+   (require 'org-github)
+   #+end_src
+
+** Configuration
+
+*** Basic Setup
+
+#+begin_src emacs-lisp
+(setq org-github-org-file "~/Documents/github.org")
+(setq org-github-default-repos '("owner/repo1" "owner/repo2"))
+#+end_src
+
+*** PARA-Style File Mapping
+
+Map repositories to specific files and parent headings:
+
+#+begin_src emacs-lisp
+(setq org-github-repo-file-alist
+      '(("owner/project-repo" . ("~/Documents/1Projects/projects.org" . "PROJECT MyProject"))
+        ("owner/area-repo" . ("~/Documents/2Areas/work.org" . "TODO Work Tasks"))))
+#+end_src
+
+Issues/PRs will be placed under:
+: * PROJECT MyProject
+: ** GitHub Issues
+: *** TODO #1 Issue title
+
+*** Time Tracking
+
+#+begin_src emacs-lisp
+;; Auto clock in when starting work
+(setq org-github-auto-clock t)
+
+;; Post time as GitHub comment when clocking out
+(setq org-github-log-to-github t)
+#+end_src
+
+*** TODO States
+
+#+begin_src emacs-lisp
+(setq org-github-issue-todo-state "TODO")
+(setq org-github-pr-todo-state "TODO")
+(setq org-github-closed-state "DONE")
+#+end_src
+
+** Usage
+
+*** Download Issues/PRs
+
+| Command                        | Description                          |
+|--------------------------------+--------------------------------------|
+| =M-x org-github-download-issues= | Download open issues from repo       |
+| =M-x org-github-download-prs=    | Download open PRs from repo          |
+| =M-x org-github-download-all=    | Download both issues and PRs         |
+| =M-x org-github-sync-repos=      | Sync all default repos               |
+| =M-x org-github-full-sync=       | Full sync (new + update states)      |
+
+*** Time Tracking
+
+| Command                          | Description                        |
+|----------------------------------+------------------------------------|
+| =M-x org-github-clock-in=          | Clock in on current issue/PR       |
+| =M-x org-github-clock-out-and-log= | Clock out, optionally log to GitHub |
+
+*** Issue Management
+
+| Command                      | Description                      |
+|------------------------------+----------------------------------|
+| =M-x org-github-view-issue=    | View issue/PR details in buffer  |
+| =M-x org-github-open-in-browser= | Open issue/PR in browser       |
+| =M-x org-github-close-issue=   | Close issue/PR on GitHub         |
+| =M-x org-github-add-comment=   | Add comment to issue/PR          |
+| =M-x org-github-create-issue=  | Create issue from Org heading    |
+
+*** Git Analysis
+
+| Command                                | Description                          |
+|----------------------------------------+--------------------------------------|
+| =M-x org-github-extract-time-from-git=   | Find commits referencing issues      |
+| =M-x org-github-estimate-time-from-commits= | Estimate time from commit patterns |
+
+** Hydra Menu (Optional)
+
+Add a hydra menu for quick access:
+
+#+begin_src emacs-lisp
+(defhydra hydra-org-github (:color blue :hint nil)
+  "
+GitHub Issues/PRs
+──────────────────────────────────────────
+_i_: Download Issues    _a_: Download All
+_p_: Download PRs       _s_: Full Sync
+_S_: Sync All Repos     _c_: Clock In
+_C_: Clock Out & Log    _v_: View Issue
+_b_: Open in Browser    _x_: Close Issue
+_m_: Add Comment        _n_: Create Issue
+_q_: Quit
+"
+  ("i" org-github-download-issues)
+  ("p" org-github-download-prs)
+  ("a" org-github-download-all)
+  ("s" org-github-full-sync)
+  ("S" org-github-sync-repos)
+  ("c" org-github-clock-in)
+  ("C" org-github-clock-out-and-log)
+  ("v" org-github-view-issue)
+  ("b" org-github-open-in-browser)
+  ("x" org-github-close-issue)
+  ("m" org-github-add-comment)
+  ("n" org-github-create-issue)
+  ("q" nil))
+#+end_src
+
+** Issue Format
+
+Issues are stored as Org headings with properties:
+
+#+begin_example
+*** TODO #42 Fix login bug :bug:enhancement:
+:PROPERTIES:
+:ISSUE_NUMBER: 42
+:REPO: owner/repo
+:STATE: open
+:URL: https://github.com/owner/repo/issues/42
+:AUTHOR: username
+:CREATED_AT: [2025-01-15 Wed 10:30]
+:UPDATED_AT: [2025-01-20 Mon 14:22]
+:ASSIGNEES: user1, user2
+:MILESTONE: v1.0
+:END:
+
+Issue body text goes here...
+#+end_example
+
+** License
+
+GPL-3.0-or-later
+
+** Contributing
+
+Contributions welcome! Please open an issue or PR on GitHub.
