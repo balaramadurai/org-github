@@ -109,6 +109,23 @@ Example:
   :type 'string
   :group 'org-github)
 
+(defcustom org-github-open-substates '("NEXT" "WAITING")
+  "Org TODO states that are sub-states of GitHub \"open\".
+When an issue is open on GitHub and the local heading uses one of
+these states, the sync will not overwrite it back to the default
+open state (e.g. TODO).  Closing the issue on GitHub will still
+change the state to `org-github-closed-state'."
+  :type '(repeat string)
+  :group 'org-github)
+
+(defcustom org-github-repo-project-alist nil
+  "Alist mapping repos to GitHub Projects V2 numbers and owners.
+Each entry is (REPO . (OWNER . PROJECT-NUMBER)).
+When set, deadlines from the project board are synced as Org DEADLINE."
+  :type '(alist :key-type string
+                :value-type (cons string integer))
+  :group 'org-github)
+
 ;;; Internal Functions
 
 (defun org-github--gh-available-p ()
@@ -148,8 +165,9 @@ Uses inactive timestamps to avoid agenda clutter."
 
 (defun org-github--state-to-todo (state type)
   "Convert GitHub STATE to Org TODO keyword based on TYPE.
-TYPE is either \\='issue or \\='pr."
-  (pcase state
+TYPE is either \\='issue or \\='pr.
+STATE is case-insensitive (gh CLI returns uppercase)."
+  (pcase (downcase state)
     ("open" (if (eq type 'pr) org-github-pr-todo-state org-github-issue-todo-state))
     ("closed" org-github-closed-state)
     ("merged" org-github-closed-state)
@@ -165,7 +183,7 @@ STATE can be \"open\", \"closed\", or \"all\" (default)."
                        (list "issue" "list" "-R" repo
                              "--state" state-arg
                              "--json" "number,title,body,state,createdAt,updatedAt,closedAt,labels,assignees,milestone,url,author"
-                             "--limit" "100"))))
+                             "--limit" "1000"))))
     (org-github--parse-json json-output)))
 
 (defun org-github--fetch-prs (repo &optional state)
@@ -176,14 +194,75 @@ STATE can be \"open\", \"closed\", \"merged\", or \"all\" (default)."
                        (list "pr" "list" "-R" repo
                              "--state" state-arg
                              "--json" "number,title,body,state,createdAt,updatedAt,closedAt,mergedAt,labels,assignees,url,author,headRefName,baseRefName"
-                             "--limit" "100"))))
+                             "--limit" "1000"))))
     (org-github--parse-json json-output)))
+
+(defun org-github--fetch-project-deadlines (repo)
+  "Fetch deadline field values from GitHub Projects V2 for REPO.
+Returns an alist of (ISSUE-NUMBER . \"YYYY-MM-DD\") for issues that have
+a Deadline field set.  Uses `org-github-repo-project-alist' to find
+the project owner and number.  Paginates through all project items."
+  (let ((project-config (cdr (assoc repo org-github-repo-project-alist))))
+    (when project-config
+      (let* ((owner (car project-config))
+             (project-num (cdr project-config))
+             (deadlines '())
+             (has-next t)
+             (cursor nil))
+        (while has-next
+          (let* ((after-clause (if cursor
+                                   (format "after: \"%s\"" cursor)
+                                 ""))
+                 (query (format "{
+  user(login: \"%s\") {
+    projectV2(number: %d) {
+      items(first: 100 %s) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          content {
+            ... on Issue {
+              number
+              repository { nameWithOwner }
+            }
+          }
+          fieldValueByName(name: \"Deadline\") {
+            ... on ProjectV2ItemFieldDateValue {
+              date
+            }
+          }
+        }
+      }
+    }
+  }
+}" owner project-num after-clause))
+                 (json-output (org-github--run-gh-sync
+                               (list "api" "graphql" "-f" (concat "query=" query))))
+                 (data (org-github--parse-json json-output))
+                 (items (alist-get 'items
+                                   (alist-get 'projectV2
+                                              (alist-get 'user
+                                                         (alist-get 'data data)))))
+                 (page-info (alist-get 'pageInfo items))
+                 (nodes (alist-get 'nodes items)))
+            (dolist (node nodes)
+              (let* ((content (alist-get 'content node))
+                     (number (alist-get 'number content))
+                     (node-repo (alist-get 'nameWithOwner (alist-get 'repository content)))
+                     (deadline-field (alist-get 'fieldValueByName node))
+                     (date (when deadline-field (alist-get 'date deadline-field))))
+                (when (and number date (string= node-repo repo))
+                  (push (cons number date) deadlines))))
+            (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+            (setq cursor (alist-get 'endCursor page-info))))
+        (message "Fetched %d deadlines from project for %s" (length deadlines) repo)
+        deadlines))))
 
 ;;; Org Conversion Functions
 
 (defun org-github--issue-to-org (issue repo)
   "Convert ISSUE to Org heading for REPO.
-Issues are created at level 3 (***) to be subtrees under GitHub Issues heading."
+Issues are created at level 3 (***) to be subtrees under GitHub Issues heading.
+If ISSUE contains a `deadline' key, it is added as an Org DEADLINE."
   (let* ((number (alist-get 'number issue))
          (title (alist-get 'title issue))
          (body (or (alist-get 'body issue) ""))
@@ -196,13 +275,20 @@ Issues are created at level 3 (***) to be subtrees under GitHub Issues heading."
          (labels (mapcar (lambda (l) (alist-get 'name l)) (alist-get 'labels issue)))
          (assignees (mapcar (lambda (a) (alist-get 'login a)) (alist-get 'assignees issue)))
          (milestone (alist-get 'title (alist-get 'milestone issue)))
+         (deadline (alist-get 'deadline issue))
          (todo-state (org-github--state-to-todo state 'issue))
          (tags (if labels (concat ":" (string-join labels ":") ":") ""))
          (body-text (string-trim body)))
     (concat
      (format "*** %s #%d %s" todo-state number title)
      (if (string-empty-p tags) "" (format " %s" tags))
-     "\n:PROPERTIES:\n"
+     "\n"
+     (if deadline
+         (format "DEADLINE: <%s>\n"
+                 (format-time-string "%Y-%m-%d %a"
+                                     (date-to-time (concat deadline "T00:00:00Z"))))
+       "")
+     ":PROPERTIES:\n"
      (format ":ISSUE_NUMBER: %d\n" number)
      (format ":REPO: %s\n" repo)
      (format ":STATE: %s\n" state)
@@ -286,8 +372,9 @@ Uses `org-github-repo-file-alist' to determine file and parent heading."
               (let ((parent-level (org-current-level))
                     (subtree-end (save-excursion (org-end-of-subtree t t) (point))))
                 ;; Look for "GitHub Issues" subheading under parent
+                ;; Allow TODO keywords and tags between stars and "GitHub Issues"
                 (if (re-search-forward
-                     (format "^\\*\\{%d\\} GitHub Issues" (1+ parent-level))
+                     (format "^\\*\\{%d\\} \\(?:[A-Z]+ \\)?GitHub Issues" (1+ parent-level))
                      subtree-end t)
                     (progn
                       (org-end-of-subtree t t)
@@ -325,14 +412,16 @@ Uses `org-github-repo-file-alist' to determine file and parent heading."
     (when (file-exists-p org-file)
       (with-current-buffer (find-file-noselect org-file)
         (save-excursion
-          (goto-char (point-min))
-          (catch 'found
-            (while (re-search-forward (format ":ISSUE_NUMBER: %d" number) nil t)
-              (save-excursion
-                (org-back-to-heading t)
-                (when (string= repo (org-entry-get (point) "REPO"))
-                  (throw 'found t))))
-            nil))))))
+          (save-restriction
+            (widen)
+            (goto-char (point-min))
+            (catch 'found
+              (while (re-search-forward (format ":ISSUE_NUMBER: %d$" number) nil t)
+                (save-excursion
+                  (org-back-to-heading t)
+                  (when (string= repo (org-entry-get (point) "REPO"))
+                    (throw 'found t))))
+              nil)))))))
 
 (defun org-github--pr-exists-p (repo number)
   "Check if PR NUMBER from REPO exists in the org file."
@@ -340,14 +429,16 @@ Uses `org-github-repo-file-alist' to determine file and parent heading."
     (when (file-exists-p org-file)
       (with-current-buffer (find-file-noselect org-file)
         (save-excursion
-          (goto-char (point-min))
-          (catch 'found
-            (while (re-search-forward (format ":PR_NUMBER: %d" number) nil t)
-              (save-excursion
-                (org-back-to-heading t)
-                (when (string= repo (org-entry-get (point) "REPO"))
-                  (throw 'found t))))
-            nil))))))
+          (save-restriction
+            (widen)
+            (goto-char (point-min))
+            (catch 'found
+              (while (re-search-forward (format ":PR_NUMBER: %d$" number) nil t)
+                (save-excursion
+                  (org-back-to-heading t)
+                  (when (string= repo (org-entry-get (point) "REPO"))
+                    (throw 'found t))))
+              nil)))))))
 
 (defun org-github--find-issue-heading (repo number)
   "Find and return position of issue NUMBER from REPO, or nil if not found."
@@ -355,14 +446,16 @@ Uses `org-github-repo-file-alist' to determine file and parent heading."
     (when (file-exists-p org-file)
       (with-current-buffer (find-file-noselect org-file)
         (save-excursion
-          (goto-char (point-min))
-          (catch 'found
-            (while (re-search-forward (format ":ISSUE_NUMBER: %d" number) nil t)
-              (save-excursion
-                (org-back-to-heading t)
-                (when (string= repo (org-entry-get (point) "REPO"))
-                  (throw 'found (point)))))
-            nil))))))
+          (save-restriction
+            (widen)
+            (goto-char (point-min))
+            (catch 'found
+              (while (re-search-forward (format ":ISSUE_NUMBER: %d$" number) nil t)
+                (save-excursion
+                  (org-back-to-heading t)
+                  (when (string= repo (org-entry-get (point) "REPO"))
+                    (throw 'found (point)))))
+              nil)))))))
 
 (defun org-github--find-pr-heading (repo number)
   "Find and return position of PR NUMBER from REPO, or nil if not found."
@@ -370,30 +463,98 @@ Uses `org-github-repo-file-alist' to determine file and parent heading."
     (when (file-exists-p org-file)
       (with-current-buffer (find-file-noselect org-file)
         (save-excursion
-          (goto-char (point-min))
-          (catch 'found
-            (while (re-search-forward (format ":PR_NUMBER: %d" number) nil t)
-              (save-excursion
-                (org-back-to-heading t)
-                (when (string= repo (org-entry-get (point) "REPO"))
-                  (throw 'found (point)))))
-            nil))))))
+          (save-restriction
+            (widen)
+            (goto-char (point-min))
+            (catch 'found
+              (while (re-search-forward (format ":PR_NUMBER: %d$" number) nil t)
+                (save-excursion
+                  (org-back-to-heading t)
+                  (when (string= repo (org-entry-get (point) "REPO"))
+                    (throw 'found (point)))))
+              nil)))))))
 
 ;;; State Synchronization
 
-(defun org-github--update-issue-state (repo number github-state)
-  "Update org-mode TODO state for issue NUMBER from REPO based on GITHUB-STATE."
+(defun org-github--update-issue-state (repo number github-state &optional deadline issue)
+  "Update org-mode TODO state for issue NUMBER from REPO based on GITHUB-STATE.
+Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects.
+Optional ISSUE is the full issue alist for updating metadata like assignees."
   (let ((pos (org-github--find-issue-heading repo number))
         (org-file (org-github--get-repo-file repo)))
     (when pos
       (with-current-buffer (find-file-noselect org-file)
-        (goto-char pos)
-        (let* ((current-state (org-entry-get (point) "STATE"))
-               (new-todo (org-github--state-to-todo github-state 'issue)))
-          (unless (string= current-state github-state)
-            (org-set-property "STATE" github-state)
-            (org-todo new-todo)
-            t))))))
+        (save-restriction
+          (widen)
+          (goto-char pos)
+          (org-back-to-heading t)
+          (let* ((current-state (org-entry-get (point) "STATE"))
+                 (new-todo (org-github--state-to-todo github-state 'issue))
+                 (current-todo (org-get-todo-state))
+                 (state-changed (not (string= (downcase (or current-state ""))
+                                               (downcase github-state))))
+                 ;; Respect open sub-states: if GitHub says open and user set
+                 ;; NEXT/WAITING, don't overwrite back to TODO
+                 (open-substate-p (and (string= (downcase github-state) "open")
+                                       (member current-todo org-github-open-substates)))
+                 (todo-wrong (and (not open-substate-p)
+                                  current-todo
+                                  (not (string= current-todo new-todo))))
+                 (changed nil))
+            (when (or state-changed todo-wrong)
+              (org-set-property "STATE" github-state)
+              (org-back-to-heading t)
+              (unless open-substate-p
+                (org-todo new-todo))
+              (setq changed t))
+            ;; Update DEADLINE if provided
+            (when deadline
+              (org-back-to-heading t)
+              (let ((dl-str (format-time-string "<%Y-%m-%d %a>"
+                                                (date-to-time (concat deadline "T00:00:00Z")))))
+                (unless (string= (or (org-entry-get (point) "DEADLINE") "") dl-str)
+                  (org-deadline nil dl-str)
+                  (setq changed t))))
+            ;; Update metadata from full issue data
+            (when issue
+              (org-back-to-heading t)
+              ;; Sync assignees
+              (let* ((assignees (mapcar (lambda (a) (alist-get 'login a))
+                                        (alist-get 'assignees issue)))
+                     (new-assignees (if assignees (string-join assignees ", ") nil))
+                     (current-assignees (org-entry-get (point) "ASSIGNEES")))
+                (when (not (equal new-assignees current-assignees))
+                  (if new-assignees
+                      (org-set-property "ASSIGNEES" new-assignees)
+                    (org-delete-property "ASSIGNEES"))
+                  (setq changed t)))
+              ;; Sync labels as tags
+              (org-back-to-heading t)
+              (let* ((labels (mapcar (lambda (l)
+                                       (replace-regexp-in-string
+                                        "-" "_" (alist-get 'name l)))
+                                     (alist-get 'labels issue)))
+                     (new-tags (if labels (concat ":" (string-join labels ":") ":") nil))
+                     (current-tags (org-get-tags nil t))
+                     (current-tag-str (if current-tags
+                                          (concat ":" (string-join current-tags ":") ":")
+                                        nil)))
+                (when (not (equal new-tags current-tag-str))
+                  (if labels
+                      (org-set-tags (string-join labels ":"))
+                    (org-set-tags nil))
+                  (setq changed t)))
+              ;; Sync milestone
+              (org-back-to-heading t)
+              (let* ((milestone (alist-get 'title (alist-get 'milestone issue)))
+                     (current-milestone (org-entry-get (point) "MILESTONE")))
+                (when (not (equal milestone current-milestone))
+                  (if milestone
+                      (org-set-property "MILESTONE" milestone)
+                    (when current-milestone
+                      (org-delete-property "MILESTONE")))
+                  (setq changed t))))
+            changed))))))
 
 (defun org-github--update-pr-state (repo number github-state merged)
   "Update org-mode TODO state for PR NUMBER from REPO.
@@ -402,42 +563,60 @@ Uses GITHUB-STATE and MERGED timestamp to determine final state."
         (org-file (org-github--get-repo-file repo)))
     (when pos
       (with-current-buffer (find-file-noselect org-file)
-        (goto-char pos)
-        (let* ((current-state (org-entry-get (point) "STATE"))
-               (effective-state (if merged "merged" github-state))
-               (new-todo (org-github--state-to-todo effective-state 'pr)))
-          (unless (string= current-state effective-state)
-            (org-set-property "STATE" effective-state)
-            (when merged
-              (org-set-property "MERGED_AT" (org-github--format-time-plain merged)))
-            (org-todo new-todo)
-            t))))))
+        (save-restriction
+          (widen)
+          (goto-char pos)
+          (org-back-to-heading t)
+          (let* ((current-state (org-entry-get (point) "STATE"))
+                 (effective-state (if merged "merged" github-state))
+                 (new-todo (org-github--state-to-todo effective-state 'pr))
+                 (current-todo (org-get-todo-state))
+                 (state-changed (not (string= (downcase (or current-state ""))
+                                               (downcase effective-state))))
+                 (todo-wrong (and current-todo
+                                  (not (string= current-todo new-todo)))))
+            (when (or state-changed todo-wrong)
+              (org-set-property "STATE" effective-state)
+              (when merged
+                (org-set-property "MERGED_AT" (org-github--format-time-plain merged)))
+              (org-back-to-heading t)
+              (org-todo new-todo)
+              t)))))))
 
 ;;; Interactive Commands
 
 ;;;###autoload
 (defun org-github-sync-issue-states (&optional repo)
   "Sync org-mode states with GitHub for all issues in REPO.
-Updates existing issues and adds new ones."
+Updates existing issues and adds new ones.  When a project mapping
+exists in `org-github-repo-project-alist', also syncs deadlines."
   (interactive)
-  (let* ((repo (or repo (read-string "Repository (owner/repo): "
-                                      (car org-github-default-repos))))
+  (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
+                                      nil nil nil nil (car org-github-default-repos))))
          (issues (org-github--fetch-issues repo "all"))
+         (deadlines (org-github--fetch-project-deadlines repo))
          (org-file (org-github--get-repo-file repo))
+         (org-github--syncing t)
          (updated-count 0)
          (new-count 0))
     (message "Syncing issues from %s..." repo)
     (with-current-buffer (find-file-noselect org-file)
-      (dolist (issue issues)
-        (let ((number (alist-get 'number issue))
-              (state (alist-get 'state issue)))
-          (if (org-github--issue-exists-p repo number)
-              (when (org-github--update-issue-state repo number state)
-                (setq updated-count (1+ updated-count)))
-            (goto-char (org-github--find-or-create-repo-heading repo))
-            (insert (org-github--issue-to-org issue repo))
-            (setq new-count (1+ new-count)))))
-      (save-buffer))
+      (save-restriction
+        (widen)
+        (dolist (issue issues)
+          (let* ((number (alist-get 'number issue))
+                 (state (alist-get 'state issue))
+                 (deadline (cdr (assq number deadlines))))
+            (if (org-github--issue-exists-p repo number)
+                (when (org-github--update-issue-state repo number state deadline issue)
+                  (setq updated-count (1+ updated-count)))
+              (goto-char (org-github--find-or-create-repo-heading repo))
+              ;; Inject deadline into issue data for formatting
+              (when deadline
+                (push (cons 'deadline deadline) issue))
+              (insert (org-github--issue-to-org issue repo))
+              (setq new-count (1+ new-count)))))
+        (save-buffer)))
     (message "Synced %s: %d new, %d updated" repo new-count updated-count)))
 
 ;;;###autoload
@@ -445,33 +624,36 @@ Updates existing issues and adds new ones."
   "Sync org-mode states with GitHub for all PRs in REPO.
 Updates existing PRs and adds new ones."
   (interactive)
-  (let* ((repo (or repo (read-string "Repository (owner/repo): "
-                                      (car org-github-default-repos))))
+  (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
+                                      nil nil nil nil (car org-github-default-repos))))
          (prs (org-github--fetch-prs repo "all"))
          (org-file (org-github--get-repo-file repo))
+         (org-github--syncing t)
          (updated-count 0)
          (new-count 0))
     (message "Syncing PRs from %s..." repo)
     (with-current-buffer (find-file-noselect org-file)
-      (dolist (pr prs)
-        (let ((number (alist-get 'number pr))
-              (state (alist-get 'state pr))
-              (merged (alist-get 'mergedAt pr)))
-          (if (org-github--pr-exists-p repo number)
-              (when (org-github--update-pr-state repo number state merged)
-                (setq updated-count (1+ updated-count)))
-            (goto-char (org-github--find-or-create-repo-heading repo))
-            (insert (org-github--pr-to-org pr repo))
-            (setq new-count (1+ new-count)))))
-      (save-buffer))
+      (save-restriction
+        (widen)
+        (dolist (pr prs)
+          (let ((number (alist-get 'number pr))
+                (state (alist-get 'state pr))
+                (merged (alist-get 'mergedAt pr)))
+            (if (org-github--pr-exists-p repo number)
+                (when (org-github--update-pr-state repo number state merged)
+                  (setq updated-count (1+ updated-count)))
+              (goto-char (org-github--find-or-create-repo-heading repo))
+              (insert (org-github--pr-to-org pr repo))
+              (setq new-count (1+ new-count)))))
+        (save-buffer)))
     (message "Synced PRs from %s: %d new, %d updated" repo new-count updated-count)))
 
 ;;;###autoload
 (defun org-github-full-sync (&optional repo)
   "Full sync: download new issues/PRs and update states of existing ones."
   (interactive)
-  (let ((repo (or repo (read-string "Repository (owner/repo): "
-                                     (car org-github-default-repos)))))
+  (let ((repo (or repo (completing-read "Repository: " org-github-default-repos
+                                         nil nil nil nil (car org-github-default-repos)))))
     (org-github-sync-issue-states repo)
     (org-github-sync-pr-states repo)))
 
@@ -479,8 +661,8 @@ Updates existing PRs and adds new ones."
 (defun org-github-download-issues (&optional repo)
   "Download open issues from REPO."
   (interactive)
-  (let* ((repo (or repo (read-string "Repository (owner/repo): "
-                                      (car org-github-default-repos))))
+  (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
+                                      nil nil nil nil (car org-github-default-repos))))
          (issues (org-github--fetch-issues repo "open"))
          (org-file (org-github--get-repo-file repo))
          (new-count 0))
@@ -500,8 +682,8 @@ Updates existing PRs and adds new ones."
 (defun org-github-download-prs (&optional repo)
   "Download open PRs from REPO."
   (interactive)
-  (let* ((repo (or repo (read-string "Repository (owner/repo): "
-                                      (car org-github-default-repos))))
+  (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
+                                      nil nil nil nil (car org-github-default-repos))))
          (prs (org-github--fetch-prs repo "open"))
          (org-file (org-github--get-repo-file repo))
          (new-count 0))
@@ -521,8 +703,8 @@ Updates existing PRs and adds new ones."
 (defun org-github-download-all (&optional repo)
   "Download issues and PRs from REPO."
   (interactive)
-  (let ((repo (or repo (read-string "Repository (owner/repo): "
-                                     (car org-github-default-repos)))))
+  (let ((repo (or repo (completing-read "Repository: " org-github-default-repos
+                                         nil nil nil nil (car org-github-default-repos)))))
     (org-github-download-issues repo)
     (org-github-download-prs repo)))
 
@@ -657,7 +839,8 @@ Updates existing PRs and adds new ones."
     (org-back-to-heading t)
     (let* ((title (org-get-heading t t t t))
            (body (org-get-entry))
-           (repo (read-string "Repository: " (car org-github-default-repos))))
+           (repo (completing-read "Repository: " org-github-default-repos
+                            nil nil nil nil (car org-github-default-repos))))
       (when (y-or-n-p (format "Create issue '%s' in %s? " title repo))
         (let ((output (org-github--run-gh-sync
                        (list "issue" "create" "-R" repo "-t" title "-b" (or body "")))))
@@ -730,6 +913,53 @@ Updates existing PRs and adds new ones."
                  (insert (format "| #%s | %dh %dm |\n" k (/ (truncate v) 60) (mod (truncate v) 60))))
                issue-work))
     (pop-to-buffer "*GitHub Time Summary*")))
+
+;;; Bidirectional Sync (Org → GitHub)
+
+(defvar org-github--syncing nil
+  "Non-nil when a GitHub→Org sync is in progress.
+Suppresses the todo-state-change hook to prevent feedback loops.")
+
+(defun org-github--on-todo-state-change ()
+  "Hook for `org-after-todo-state-change-hook'.
+When a GitHub-linked heading is marked DONE, close the issue on
+GitHub and prompt for an optional closing comment.
+Suppressed during sync operations."
+  (unless org-github--syncing
+    (when-let* ((repo (org-entry-get (point) "REPO"))
+                (issue-num (org-entry-get (point) "ISSUE_NUMBER"))
+                (new-state org-state))
+      (cond
+       ;; Marked as DONE → close on GitHub
+       ((string= new-state org-github-closed-state)
+        (let ((comment (read-string
+                        (format "Closing note for #%s (empty to skip): " issue-num))))
+          (unless (string-empty-p comment)
+            (condition-case err
+                (org-github--run-gh-sync
+                 (list "issue" "comment" issue-num "-R" repo "-b" comment))
+              (error (message "Failed to add comment: %s" (error-message-string err)))))
+          (condition-case err
+              (progn
+                (org-github--run-gh-sync
+                 (list "issue" "close" issue-num "-R" repo))
+                (org-set-property "STATE" "CLOSED")
+                (message "Closed #%s on GitHub%s" issue-num
+                         (if (string-empty-p comment) "" " (with comment)")))
+            (error (message "Failed to close issue: %s" (error-message-string err))))))
+       ;; Reopened (back to TODO/NEXT from DONE) → reopen on GitHub
+       ((and (member new-state (cons org-github-issue-todo-state
+                                      org-github-open-substates))
+             (string= (downcase (or (org-entry-get (point) "STATE") "")) "closed"))
+        (condition-case err
+            (progn
+              (org-github--run-gh-sync
+               (list "issue" "reopen" issue-num "-R" repo))
+              (org-set-property "STATE" "OPEN")
+              (message "Reopened #%s on GitHub" issue-num))
+          (error (message "Failed to reopen issue: %s" (error-message-string err)))))))))
+
+(add-hook 'org-after-todo-state-change-hook #'org-github--on-todo-state-change)
 
 (provide 'org-github)
 
