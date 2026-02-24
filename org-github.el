@@ -105,7 +105,17 @@ Example:
   :group 'org-github)
 
 (defcustom org-github-closed-state "DONE"
-  "State for closed/merged items."
+  "State for closed issues."
+  :type 'string
+  :group 'org-github)
+
+(defcustom org-github-pr-closed-state "CANCELLED"
+  "State for PRs closed without merging."
+  :type 'string
+  :group 'org-github)
+
+(defcustom org-github-pr-merged-state "DONE"
+  "State for merged PRs."
   :type 'string
   :group 'org-github)
 
@@ -169,8 +179,8 @@ TYPE is either \\='issue or \\='pr.
 STATE is case-insensitive (gh CLI returns uppercase)."
   (pcase (downcase state)
     ("open" (if (eq type 'pr) org-github-pr-todo-state org-github-issue-todo-state))
-    ("closed" org-github-closed-state)
-    ("merged" org-github-closed-state)
+    ("closed" (if (eq type 'pr) org-github-pr-closed-state org-github-closed-state))
+    ("merged" org-github-pr-merged-state)
     (_ org-github-issue-todo-state)))
 
 ;;; GitHub API Functions
@@ -257,6 +267,11 @@ the project owner and number.  Paginates through all project items."
         (message "Fetched %d deadlines from project for %s" (length deadlines) repo)
         deadlines))))
 
+(defun org-github--sanitize-tag (name)
+  "Sanitize GitHub label NAME for use as an Org tag.
+Replaces spaces, hyphens, and other invalid tag characters with underscores."
+  (replace-regexp-in-string "[^[:alnum:]_@#%]" "_" name))
+
 ;;; Org Conversion Functions
 
 (defun org-github--issue-to-org (issue repo)
@@ -272,7 +287,7 @@ If ISSUE contains a `deadline' key, it is added as an Org DEADLINE."
          (updated (alist-get 'updatedAt issue))
          (closed (alist-get 'closedAt issue))
          (author (alist-get 'login (alist-get 'author issue)))
-         (labels (mapcar (lambda (l) (alist-get 'name l)) (alist-get 'labels issue)))
+         (labels (mapcar (lambda (l) (org-github--sanitize-tag (alist-get 'name l))) (alist-get 'labels issue)))
          (assignees (mapcar (lambda (a) (alist-get 'login a)) (alist-get 'assignees issue)))
          (milestone (alist-get 'title (alist-get 'milestone issue)))
          (deadline (alist-get 'deadline issue))
@@ -318,7 +333,7 @@ PRs are created at level 3 (***) to be subtrees under GitHub Issues heading."
          (author (alist-get 'login (alist-get 'author pr)))
          (head-ref (alist-get 'headRefName pr))
          (base-ref (alist-get 'baseRefName pr))
-         (labels (mapcar (lambda (l) (alist-get 'name l)) (alist-get 'labels pr)))
+         (labels (mapcar (lambda (l) (org-github--sanitize-tag (alist-get 'name l))) (alist-get 'labels pr)))
          (assignees (mapcar (lambda (a) (alist-get 'login a)) (alist-get 'assignees pr)))
          (todo-state (org-github--state-to-todo (if merged "merged" state) 'pr))
          (tags (concat ":PR:" (if labels (concat (string-join labels ":") ":") "")))
@@ -531,8 +546,7 @@ Optional ISSUE is the full issue alist for updating metadata like assignees."
               ;; Sync labels as tags
               (org-back-to-heading t)
               (let* ((labels (mapcar (lambda (l)
-                                       (replace-regexp-in-string
-                                        "-" "_" (alist-get 'name l)))
+                                       (org-github--sanitize-tag (alist-get 'name l)))
                                      (alist-get 'labels issue)))
                      (new-tags (if labels (concat ":" (string-join labels ":") ":") nil))
                      (current-tags (org-get-tags nil t))
@@ -553,12 +567,25 @@ Optional ISSUE is the full issue alist for updating metadata like assignees."
                       (org-set-property "MILESTONE" milestone)
                     (when current-milestone
                       (org-delete-property "MILESTONE")))
-                  (setq changed t))))
+                  (setq changed t)))
+              ;; Sync timestamps from GitHub
+              (org-back-to-heading t)
+              (let ((updated (org-github--format-time-plain
+                              (alist-get 'updatedAt issue)))
+                    (closed (org-github--format-time-plain
+                             (alist-get 'closedAt issue))))
+                (when updated
+                  (org-set-property "UPDATED_AT" updated))
+                (if closed
+                    (org-set-property "CLOSED_AT" closed)
+                  (when (org-entry-get (point) "CLOSED_AT")
+                    (org-delete-property "CLOSED_AT")))))
             changed))))))
 
-(defun org-github--update-pr-state (repo number github-state merged)
+(defun org-github--update-pr-state (repo number github-state merged &optional pr)
   "Update org-mode TODO state for PR NUMBER from REPO.
-Uses GITHUB-STATE and MERGED timestamp to determine final state."
+Uses GITHUB-STATE and MERGED timestamp to determine final state.
+Optional PR is the full PR alist for updating timestamps."
   (let ((pos (org-github--find-pr-heading repo number))
         (org-file (org-github--get-repo-file repo)))
     (when pos
@@ -574,14 +601,56 @@ Uses GITHUB-STATE and MERGED timestamp to determine final state."
                  (state-changed (not (string= (downcase (or current-state ""))
                                                (downcase effective-state))))
                  (todo-wrong (and current-todo
-                                  (not (string= current-todo new-todo)))))
+                                  (not (string= current-todo new-todo))))
+                 (changed nil))
             (when (or state-changed todo-wrong)
               (org-set-property "STATE" effective-state)
               (when merged
                 (org-set-property "MERGED_AT" (org-github--format-time-plain merged)))
               (org-back-to-heading t)
               (org-todo new-todo)
-              t)))))))
+              (setq changed t))
+            ;; Sync metadata from full PR data
+            (when pr
+              ;; Sync assignees
+              (org-back-to-heading t)
+              (let* ((assignees (mapcar (lambda (a) (alist-get 'login a))
+                                        (alist-get 'assignees pr)))
+                     (new-assignees (if assignees (string-join assignees ", ") nil))
+                     (current-assignees (org-entry-get (point) "ASSIGNEES")))
+                (when (not (equal new-assignees current-assignees))
+                  (if new-assignees
+                      (org-set-property "ASSIGNEES" new-assignees)
+                    (org-delete-property "ASSIGNEES"))
+                  (setq changed t)))
+              ;; Sync labels as tags
+              (org-back-to-heading t)
+              (let* ((labels (mapcar (lambda (l)
+                                       (org-github--sanitize-tag (alist-get 'name l)))
+                                     (alist-get 'labels pr)))
+                     (new-tags (if labels (concat ":" (string-join labels ":") ":") nil))
+                     (current-tags (org-get-tags nil t))
+                     (current-tag-str (if current-tags
+                                          (concat ":" (string-join current-tags ":") ":")
+                                        nil)))
+                (when (not (equal new-tags current-tag-str))
+                  (if labels
+                      (org-set-tags (string-join labels ":"))
+                    (org-set-tags nil))
+                  (setq changed t)))
+              ;; Sync timestamps
+              (org-back-to-heading t)
+              (let ((updated (org-github--format-time-plain
+                              (alist-get 'updatedAt pr)))
+                    (closed (org-github--format-time-plain
+                             (alist-get 'closedAt pr))))
+                (when updated
+                  (org-set-property "UPDATED_AT" updated))
+                (if closed
+                    (org-set-property "CLOSED_AT" closed)
+                  (when (org-entry-get (point) "CLOSED_AT")
+                    (org-delete-property "CLOSED_AT")))))
+            changed))))))
 
 ;;; Interactive Commands
 
@@ -640,7 +709,7 @@ Updates existing PRs and adds new ones."
                 (state (alist-get 'state pr))
                 (merged (alist-get 'mergedAt pr)))
             (if (org-github--pr-exists-p repo number)
-                (when (org-github--update-pr-state repo number state merged)
+                (when (org-github--update-pr-state repo number state merged pr)
                   (setq updated-count (1+ updated-count)))
               (goto-char (org-github--find-or-create-repo-heading repo))
               (insert (org-github--pr-to-org pr repo))
@@ -810,6 +879,10 @@ Updates existing PRs and adds new ones."
               (org-github--run-gh-sync (list type "close" num "-R" repo))
               (org-todo org-github-closed-state)
               (org-set-property "STATE" "closed")
+              (org-set-property "CLOSED_AT"
+                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
+              (org-set-property "UPDATED_AT"
+                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
               (message "Closed %s #%s" type num)))
         (message "Not on a GitHub issue/PR")))))
 
@@ -944,6 +1017,10 @@ Suppressed during sync operations."
                 (org-github--run-gh-sync
                  (list "issue" "close" issue-num "-R" repo))
                 (org-set-property "STATE" "CLOSED")
+                (org-set-property "CLOSED_AT"
+                                  (format-time-string "[%Y-%m-%d %a %H:%M]"))
+                (org-set-property "UPDATED_AT"
+                                  (format-time-string "[%Y-%m-%d %a %H:%M]"))
                 (message "Closed #%s on GitHub%s" issue-num
                          (if (string-empty-p comment) "" " (with comment)")))
             (error (message "Failed to close issue: %s" (error-message-string err))))))
@@ -956,6 +1033,9 @@ Suppressed during sync operations."
               (org-github--run-gh-sync
                (list "issue" "reopen" issue-num "-R" repo))
               (org-set-property "STATE" "OPEN")
+              (org-delete-property "CLOSED_AT")
+              (org-set-property "UPDATED_AT"
+                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
               (message "Reopened #%s on GitHub" issue-num))
           (error (message "Failed to reopen issue: %s" (error-message-string err)))))))))
 
