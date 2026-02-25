@@ -98,6 +98,12 @@ updated within the last DAYS days.  nil means no time filter."
                  (cons :tag "Period" string integer))
   :group 'org-github-dashboard)
 
+(defcustom org-github-dashboard-discord-webhook-url nil
+  "Discord webhook URL for sending weekly summaries.
+When nil, `org-github-dashboard-send-discord' will prompt for a URL."
+  :type '(choice (const :tag "Not configured" nil) string)
+  :group 'org-github-dashboard)
+
 ;;; org-ql Predicates
 
 (with-eval-after-load 'org-ql
@@ -636,6 +642,308 @@ Respect assignee, status, and period filters."
   (interactive)
   (org-agenda nil "gt")
   (delete-other-windows))
+
+;;; Discord Integration
+
+(defun org-github-dashboard--collect-discord-items (repos target-date)
+  "Collect open GitHub items from REPOS due on or before TARGET-DATE.
+TARGET-DATE is a \"YYYY-MM-DD\" string.  Returns an alist of
+((ASSIGNEE . ((:title T :type issue|pr :number N
+               :repo R :deadline D :overdue BOOL) ...)) ...).
+Items without a DEADLINE are included under a \"No Deadline\" section
+when they are open."
+  (let* ((org-github-dashboard-repos repos)
+         (today (format-time-string "%Y-%m-%d"))
+         (query (org-github-dashboard--filtered-issue-query '(todo)))
+         (items (org-ql-select (org-agenda-files) query
+                  :action (lambda ()
+                            (let* ((title (org-get-heading t t t t))
+                                   (repo (org-entry-get (point) "REPO"))
+                                   (pr-num (org-entry-get (point) "PR_NUMBER"))
+                                   (iss-num (org-entry-get (point) "ISSUE_NUMBER"))
+                                   (assignees-raw (org-entry-get (point) "ASSIGNEES"))
+                                   (dl-raw (org-entry-get (point) "DEADLINE"))
+                                   (dl-date (when dl-raw
+                                              (org-github-dashboard--date-from-ts dl-raw))))
+                              ;; Include if: has deadline <= target-date, OR has no deadline
+                              (when (or (and dl-date (not (string< target-date dl-date)))
+                                        (null dl-date))
+                                (list :title title :repo repo
+                                      :type (if pr-num 'pr 'issue)
+                                      :number (string-to-number (or pr-num iss-num "0"))
+                                      :assignees (when assignees-raw
+                                                   (split-string assignees-raw "," t " +"))
+                                      :deadline dl-date
+                                      :overdue (and dl-date (string< dl-date today))))))))
+         (by-assignee (make-hash-table :test 'equal)))
+    (setq items (delq nil items))
+    ;; Skip items with no assignees
+    (dolist (item items)
+      (let ((names (plist-get item :assignees)))
+        (when names
+          (dolist (name names)
+            (push item (gethash name by-assignee))))))
+    (let ((result nil))
+      (maphash (lambda (k v) (push (cons k (nreverse v)) result)) by-assignee)
+      (sort result (lambda (a b) (string< (car a) (car b)))))))
+
+(defun org-github-dashboard--collect-discord-completed (repos since-date)
+  "Collect GitHub items from REPOS closed on or after SINCE-DATE.
+SINCE-DATE is a \"YYYY-MM-DD\" string.  Returns an alist of
+((ASSIGNEE . ((:title T :type issue|pr :number N
+               :repo R :closed-date D) ...)) ...)."
+  (let* ((org-github-dashboard-repos repos)
+         (query (org-github-dashboard--filtered-issue-query '(done)))
+         (items (org-ql-select (org-agenda-files) query
+                  :action (lambda ()
+                            (let* ((title (org-get-heading t t t t))
+                                   (repo (org-entry-get (point) "REPO"))
+                                   (pr-num (org-entry-get (point) "PR_NUMBER"))
+                                   (iss-num (org-entry-get (point) "ISSUE_NUMBER"))
+                                   (assignees-raw (org-entry-get (point) "ASSIGNEES"))
+                                   (closed-raw (org-entry-get (point) "CLOSED_AT"))
+                                   (closed-date (org-github-dashboard--date-from-ts closed-raw)))
+                              (when (and closed-date
+                                         (not (string< closed-date since-date)))
+                                (list :title title :repo repo
+                                      :type (if pr-num 'pr 'issue)
+                                      :number (string-to-number (or pr-num iss-num "0"))
+                                      :assignees (when assignees-raw
+                                                   (split-string assignees-raw "," t " +"))
+                                      :closed-date closed-date))))))
+         (by-assignee (make-hash-table :test 'equal)))
+    (setq items (delq nil items))
+    ;; Skip items with no assignees
+    (dolist (item items)
+      (let ((names (plist-get item :assignees)))
+        (when names
+          (dolist (name names)
+            (push item (gethash name by-assignee))))))
+    (let ((result nil))
+      (maphash (lambda (k v) (push (cons k (nreverse v)) result)) by-assignee)
+      (sort result (lambda (a b) (string< (car a) (car b)))))))
+
+(defun org-github-dashboard--fetch-pending-reviews (repos)
+  "Fetch open PRs with pending review requests from REPOS via gh CLI.
+Return an alist of ((REVIEWER . ((:title T :number N :repo R :author A) ...)) ...)."
+  (let ((by-reviewer (make-hash-table :test 'equal)))
+    (dolist (repo repos)
+      (let* ((output (org-github--run-gh-sync
+                      (list "pr" "list" "-R" repo "--state" "open"
+                            "--json" "number,title,reviewRequests,author"
+                            "--limit" "100")))
+             (prs (org-github--parse-json output)))
+        (dolist (pr prs)
+          (let ((requests (alist-get 'reviewRequests pr))
+                (number (alist-get 'number pr))
+                (title (alist-get 'title pr))
+                (author (alist-get 'login (alist-get 'author pr))))
+            (dolist (req requests)
+              (let ((reviewer (alist-get 'login req)))
+                (when reviewer
+                  (push (list :title title :number number
+                              :repo repo :author (or author ""))
+                        (gethash reviewer by-reviewer)))))))))
+    (let ((result nil))
+      (maphash (lambda (k v) (push (cons k (nreverse v)) result)) by-reviewer)
+      (sort result (lambda (a b) (string< (car a) (car b)))))))
+
+(defun org-github-dashboard--format-discord-message (repos &optional target-date since-date)
+  "Format a Discord markdown summary for REPOS.
+When TARGET-DATE (a \"YYYY-MM-DD\" string) is given, only include
+open items due on or before that date, grouped by assignee with
+overdue items flagged.  When SINCE-DATE is also given, append a
+section of items completed since that date.  When both are nil,
+show the all-open-items weekly summary."
+  (if (null target-date)
+      ;; Original all-open-items summary
+      (let* ((org-github-dashboard-repos repos)
+             (all-assignees (seq-remove
+                             (lambda (a) (member a org-github-dashboard-excluded-assignees))
+                             (org-github-dashboard--collect-assignees)))
+             (assignees (if org-github-dashboard-assignees
+                           (seq-filter (lambda (a) (member a org-github-dashboard-assignees))
+                                       all-assignees)
+                         all-assignees))
+             (mon (format-time-string "%b %d"))
+             (sun (format-time-string "%b %d"
+                                      (time-add (current-time) (days-to-time 6))))
+             (lines (list (format "## Weekly GitHub Summary — %s to %s" mon sun) ""))
+             (total-oi 0) (total-op 0))
+        (dolist (name assignees)
+          (let* ((s (org-github-dashboard--collect-all-stats name))
+                 (oi (plist-get s :open-issues))
+                 (op (plist-get s :open-prs)))
+            (cl-incf total-oi oi)
+            (cl-incf total-op op)
+            (when (> (+ oi op) 0)
+              (push (format "**%s** — %d open issue%s, %d open PR%s"
+                            name oi (if (= oi 1) "" "s") op (if (= op 1) "" "s"))
+                    lines))))
+        (push "" lines)
+        (push (format "**Team Total** — %d open issue%s, %d open PR%s"
+                      total-oi (if (= total-oi 1) "" "s")
+                      total-op (if (= total-op 1) "" "s"))
+              lines)
+        (push "" lines)
+        (push (format "_Repos: %s_" (string-join (or repos '("all")) ", ")) lines)
+        (string-join (nreverse lines) "\n"))
+    ;; Date-filtered summary: due on or before target-date, with overdue flagged
+    (let* ((by-assignee (org-github-dashboard--collect-discord-items repos target-date))
+           (today (format-time-string "%Y-%m-%d"))
+           (date-label (format-time-string "%a, %b %d"
+                                           (date-to-time (concat target-date "T00:00:00Z"))))
+           (lines (list (format "## GitHub Tasks Due by %s" date-label) ""))
+           (total-due 0) (total-overdue 0))
+      (dolist (entry by-assignee)
+        (let* ((name (car entry))
+               (items (cdr entry))
+               (overdue (seq-filter (lambda (i) (plist-get i :overdue)) items))
+               (due-on (seq-filter (lambda (i) (and (plist-get i :deadline)
+                                                     (not (plist-get i :overdue)))) items))
+               (no-deadline (seq-filter (lambda (i) (null (plist-get i :deadline))) items)))
+          (cl-incf total-due (length items))
+          (cl-incf total-overdue (length overdue))
+          (push (format "### %s (%d item%s)" name (length items)
+                        (if (= (length items) 1) "" "s"))
+                lines)
+          (when overdue
+            (push (format "> :warning: **%d overdue**" (length overdue)) lines)
+            (dolist (item overdue)
+              (push (format "- ~~%s~~ %s #%d (was due %s)"
+                            (plist-get item :title)
+                            (if (eq (plist-get item :type) 'pr) "PR" "Issue")
+                            (plist-get item :number)
+                            (plist-get item :deadline))
+                    lines)))
+          (when due-on
+            (dolist (item due-on)
+              (push (format "- %s — %s #%d (due %s)"
+                            (plist-get item :title)
+                            (if (eq (plist-get item :type) 'pr) "PR" "Issue")
+                            (plist-get item :number)
+                            (plist-get item :deadline))
+                    lines)))
+          (when no-deadline
+            (push (format "> %d with no deadline" (length no-deadline)) lines)
+            (dolist (item no-deadline)
+              (push (format "- %s — %s #%d"
+                            (plist-get item :title)
+                            (if (eq (plist-get item :type) 'pr) "PR" "Issue")
+                            (plist-get item :number))
+                    lines)))
+          (push "" lines)))
+      (when (zerop total-due)
+        (push "No tasks due by this date. :tada:" lines)
+        (push "" lines))
+      (push (format "**Total: %d task%s due, %d overdue**"
+                    total-due (if (= total-due 1) "" "s") total-overdue)
+            lines)
+      ;; Completed section
+      (when since-date
+        (let* ((by-assignee-done (org-github-dashboard--collect-discord-completed repos since-date))
+               (since-label (format-time-string "%a, %b %d"
+                                                (date-to-time (concat since-date "T00:00:00Z"))))
+               (total-completed 0))
+          (push "" lines)
+          (push (format "---\n## Completed Since %s" since-label) lines)
+          (push "" lines)
+          (dolist (entry by-assignee-done)
+            (let* ((name (car entry))
+                   (items (cdr entry)))
+              (cl-incf total-completed (length items))
+              (push (format "### %s (%d completed)" name (length items)) lines)
+              (dolist (item items)
+                (push (format "- ~~%s~~ %s #%d (closed %s)"
+                              (plist-get item :title)
+                              (if (eq (plist-get item :type) 'pr) "PR" "Issue")
+                              (plist-get item :number)
+                              (plist-get item :closed-date))
+                      lines))
+              (push "" lines)))
+          (if (zerop total-completed)
+              (push "No items completed in this period." lines)
+            (push (format "**Total: %d completed**" total-completed) lines))))
+      ;; Pending reviews section (fetched live from GitHub)
+      (let ((by-reviewer (org-github-dashboard--fetch-pending-reviews repos)))
+        (when by-reviewer
+          (let ((total-reviews 0))
+            (push "" lines)
+            (push "---\n## Pending Reviews" lines)
+            (push "" lines)
+            (dolist (entry by-reviewer)
+              (let* ((reviewer (car entry))
+                     (prs (cdr entry)))
+                (cl-incf total-reviews (length prs))
+                (push (format "### %s (%d to review)" reviewer (length prs)) lines)
+                (dolist (pr prs)
+                  (push (format "- PR #%d: %s (by %s)"
+                                (plist-get pr :number)
+                                (plist-get pr :title)
+                                (plist-get pr :author))
+                        lines))
+                (push "" lines)))
+            (push (format "**Total: %d review%s pending**"
+                          total-reviews (if (= total-reviews 1) "" "s"))
+                  lines))))
+      (push "" lines)
+      (push (format "_Repos: %s_" (string-join (or repos '("all")) ", ")) lines)
+      (string-join (nreverse lines) "\n"))))
+
+(defun org-github-dashboard--send-discord-webhook (message)
+  "Send MESSAGE to the configured Discord webhook URL.
+Returns non-nil on success."
+  (let* ((url (or org-github-dashboard-discord-webhook-url
+                  (user-error "Set `org-github-dashboard-discord-webhook-url' first")))
+         (url-request-method "POST")
+         (url-request-extra-headers '(("Content-Type" . "application/json")))
+         (payload (json-encode `((content . ,message))))
+         (url-request-data (encode-coding-string payload 'utf-8))
+         (buf (url-retrieve-synchronously url t nil 30)))
+    (when buf
+      (unwind-protect
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (let ((ok (and (re-search-forward "HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                           (member (match-string 1) '("200" "204")))))
+              (if ok
+                  (progn (message "Discord message sent successfully.") t)
+                (message "Discord webhook failed: %s"
+                         (buffer-substring (point-min) (min (point-max) 500)))
+                nil)))
+        (kill-buffer buf)))))
+
+;;;###autoload
+(defun org-github-dashboard-send-discord (target-date since-date)
+  "Send a GitHub summary to Discord.
+TARGET-DATE is a \"YYYY-MM-DD\" string for the due-by cutoff.
+SINCE-DATE is a \"YYYY-MM-DD\" string; completed items closed on or
+after this date are included.  Interactively, both use the Org date
+picker.  With prefix arg (C-u), sends the all-open-items weekly
+summary instead.
+Prompts for repos if `org-github-dashboard-repos' is not set.
+Shows a preview buffer for confirmation before sending."
+  (interactive
+   (if current-prefix-arg
+       (list nil nil)
+     (list (org-read-date nil nil nil "Tasks due by: ")
+           (org-read-date nil nil nil "Completed since: "))))
+  (let* ((repos (or org-github-dashboard-repos
+                    (let ((all (org-github-dashboard--collect-repos)))
+                      (completing-read-multiple
+                       "Repos (comma-separated): " all nil t))))
+         (repo-list (if (listp repos) repos (list repos)))
+         (msg (org-github-dashboard--format-discord-message repo-list target-date since-date)))
+    (with-current-buffer (get-buffer-create "*Discord Preview*")
+      (erase-buffer)
+      (insert msg)
+      (goto-char (point-min))
+      (display-buffer (current-buffer)))
+    (when (y-or-n-p "Send this message to Discord? ")
+      (org-github-dashboard--send-discord-webhook msg))
+    (when-let ((win (get-buffer-window "*Discord Preview*")))
+      (delete-window win))
+    (kill-buffer "*Discord Preview*")))
 
 (provide 'org-github-dashboard)
 
