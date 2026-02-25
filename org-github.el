@@ -1,10 +1,10 @@
-;;; org-github.el --- GitHub Issues/PRs with Org-mode time tracking -*- lexical-binding: t; -*-
+;;; org-github.el --- GitHub Issues/PRs integration with Org-mode -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025 Bala Ramadurai
 ;; Author: Bala Ramadurai <bala@balaramadurai.net>
 ;; Version: 1.0.0
 ;; Package-Requires: ((emacs "27.1") (org "9.0"))
-;; Keywords: org, github, issues, time-tracking
+;; Keywords: convenience tools vc
 ;; URL: https://github.com/balaramadurai/org-github
 
 ;; This file is not part of GNU Emacs.
@@ -48,12 +48,14 @@
 (require 'json)
 (require 'subr-x)
 
+(defvar org-state)  ; dynamically bound by org-todo
+
 (defgroup org-github nil
   "Settings for org-github."
   :group 'org
   :prefix "org-github-")
 
-(defcustom org-github-org-file "~/Documents/1Projects/github.org"
+(defcustom org-github-org-file (expand-file-name "github.org" org-directory)
   "Default path to Org file for GitHub issues.
 Used when no specific mapping exists in `org-github-repo-file-alist'."
   :type 'string
@@ -1039,7 +1041,16 @@ Suppressed during sync operations."
               (message "Reopened #%s on GitHub" issue-num))
           (error (message "Failed to reopen issue: %s" (error-message-string err)))))))))
 
-(add-hook 'org-after-todo-state-change-hook #'org-github--on-todo-state-change)
+;;;###autoload
+(define-minor-mode org-github-mode
+  "Global minor mode enabling bidirectional Org-to-GitHub state sync.
+When enabled, changing a TODO state on a GitHub-linked heading
+will update the issue/PR on GitHub accordingly."
+  :global t
+  :lighter " OGH"
+  (if org-github-mode
+      (add-hook 'org-after-todo-state-change-hook #'org-github--on-todo-state-change)
+    (remove-hook 'org-after-todo-state-change-hook #'org-github--on-todo-state-change)))
 
 (provide 'org-github)
 

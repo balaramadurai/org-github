@@ -2,19 +2,23 @@
 #+AUTHOR: Bala Ramadurai
 #+OPTIONS: toc:2 num:nil
 
+[[https://melpa.org/#/org-github][file:https://melpa.org/packages/org-github-badge.svg]]
+
 * org-github
 
-GitHub Issues/PRs integration with Org-mode and time tracking.
+GitHub Issues/PRs integration with Org-mode, featuring bidirectional state
+sync, time tracking, and an optional team dashboard.
 
 ** Features
 
 - Fetch GitHub issues and PRs into Org headings with full metadata
+- Bidirectional sync: change TODO state in Org and it updates GitHub
 - Clock in/out on issues with optional time logging to GitHub
-- Sync issue/PR states between GitHub and Org-mode
 - Create issues from Org headings
 - Add comments to issues/PRs from Emacs
-- Extract and estimate time from git commit history
+- Distinguish merged vs closed-without-merge PRs (DONE vs CANCELLED)
 - PARA-compatible file organization via repo-to-file mappings
+- *Optional team dashboard* with per-assignee progress bars and filtering
 
 ** Requirements
 
@@ -23,6 +27,23 @@ GitHub Issues/PRs integration with Org-mode and time tracking.
 - [[https://cli.github.com/][GitHub CLI (gh)]] installed and authenticated
 
 ** Installation
+
+*** MELPA
+
+#+begin_src emacs-lisp
+(use-package org-github
+  :ensure t
+  :defer t
+  :commands (org-github-download-issues
+             org-github-download-prs
+             org-github-download-all
+             org-github-sync-repos
+             org-github-full-sync)
+  :custom
+  (org-github-default-repos '("owner/repo"))
+  :config
+  (org-github-mode 1))
+#+end_src
 
 *** straight.el
 
@@ -34,21 +55,21 @@ GitHub Issues/PRs integration with Org-mode and time tracking.
              org-github-download-prs
              org-github-download-all
              org-github-sync-repos
-             org-github-full-sync
-             org-github-clock-in
-             org-github-clock-out-and-log)
+             org-github-full-sync)
   :custom
-  (org-github-org-file "~/Documents/github.org")
-  (org-github-default-repos '("owner/repo")))
+  (org-github-default-repos '("owner/repo"))
+  :config
+  (org-github-mode 1))
 #+end_src
 
-*** Manual Installation
+*** Manual
 
 1. Clone this repository
 2. Add to your load-path:
    #+begin_src emacs-lisp
    (add-to-list 'load-path "/path/to/org-github")
    (require 'org-github)
+   (org-github-mode 1)
    #+end_src
 
 ** Configuration
@@ -56,8 +77,14 @@ GitHub Issues/PRs integration with Org-mode and time tracking.
 *** Basic Setup
 
 #+begin_src emacs-lisp
-(setq org-github-org-file "~/Documents/github.org")
+;; Default org file (defaults to github.org in org-directory)
+(setq org-github-org-file "~/org/github.org")
+
+;; Repos to track
 (setq org-github-default-repos '("owner/repo1" "owner/repo2"))
+
+;; Enable bidirectional sync (Org TODO changes update GitHub)
+(org-github-mode 1)
 #+end_src
 
 *** PARA-Style File Mapping
@@ -66,8 +93,8 @@ Map repositories to specific files and parent headings:
 
 #+begin_src emacs-lisp
 (setq org-github-repo-file-alist
-      '(("owner/project-repo" . ("~/Documents/1Projects/projects.org" . "PROJECT MyProject"))
-        ("owner/area-repo" . ("~/Documents/2Areas/work.org" . "TODO Work Tasks"))))
+      '(("owner/project-repo" . ("~/org/projects.org" . "PROJECT MyProject"))
+        ("owner/area-repo" . ("~/org/areas.org" . "TODO Work Tasks"))))
 #+end_src
 
 Issues/PRs will be placed under:
@@ -75,90 +102,98 @@ Issues/PRs will be placed under:
 : ** GitHub Issues
 : *** TODO #1 Issue title
 
+*** PR State Configuration
+
+Distinguish merged PRs from rejected ones:
+
+#+begin_src emacs-lisp
+;; Default: merged PRs → DONE, closed-without-merge → CANCELLED
+(setq org-github-pr-merged-state "DONE")
+(setq org-github-pr-closed-state "CANCELLED")
+#+end_src
+
 *** Time Tracking
 
 #+begin_src emacs-lisp
-;; Auto clock in when starting work
-(setq org-github-auto-clock t)
-
-;; Post time as GitHub comment when clocking out
-(setq org-github-log-to-github t)
-#+end_src
-
-*** TODO States
-
-#+begin_src emacs-lisp
-(setq org-github-issue-todo-state "TODO")
-(setq org-github-pr-todo-state "TODO")
-(setq org-github-closed-state "DONE")
+(setq org-github-auto-clock t)          ; auto clock in
+(setq org-github-log-to-github t)       ; post time as GitHub comment
 #+end_src
 
 ** Usage
 
 *** Download Issues/PRs
 
-| Command                        | Description                          |
-|--------------------------------+--------------------------------------|
-| =M-x org-github-download-issues= | Download open issues from repo       |
-| =M-x org-github-download-prs=    | Download open PRs from repo          |
-| =M-x org-github-download-all=    | Download both issues and PRs         |
-| =M-x org-github-sync-repos=      | Sync all default repos               |
-| =M-x org-github-full-sync=       | Full sync (new + update states)      |
+| Command                          | Description                     |
+|----------------------------------+---------------------------------|
+| =M-x org-github-download-issues=  | Download open issues from repo  |
+| =M-x org-github-download-prs=     | Download open PRs from repo     |
+| =M-x org-github-download-all=     | Download both issues and PRs    |
+| =M-x org-github-sync-repos=       | Sync all default repos          |
+| =M-x org-github-full-sync=        | Full sync (new + update states) |
+
+*** Bidirectional Sync
+
+When =org-github-mode= is enabled, changing a TODO state on a GitHub-linked
+heading automatically updates the issue on GitHub:
+
+- Mark DONE → closes the issue/PR (with optional comment)
+- Reopen (TODO/NEXT from DONE) → reopens on GitHub
+- Sub-states like NEXT or WAITING are preserved during sync
 
 *** Time Tracking
 
-| Command                          | Description                        |
-|----------------------------------+------------------------------------|
-| =M-x org-github-clock-in=          | Clock in on current issue/PR       |
-| =M-x org-github-clock-out-and-log= | Clock out, optionally log to GitHub |
+| Command                            | Description                         |
+|------------------------------------+-------------------------------------|
+| =M-x org-github-clock-in=           | Clock in on current issue/PR        |
+| =M-x org-github-clock-out-and-log=  | Clock out, optionally log to GitHub |
 
 *** Issue Management
 
-| Command                      | Description                      |
-|------------------------------+----------------------------------|
-| =M-x org-github-view-issue=    | View issue/PR details in buffer  |
-| =M-x org-github-open-in-browser= | Open issue/PR in browser       |
-| =M-x org-github-close-issue=   | Close issue/PR on GitHub         |
-| =M-x org-github-add-comment=   | Add comment to issue/PR          |
-| =M-x org-github-create-issue=  | Create issue from Org heading    |
+| Command                         | Description                     |
+|---------------------------------+---------------------------------|
+| =M-x org-github-view-issue=      | View issue/PR details in buffer |
+| =M-x org-github-open-in-browser= | Open issue/PR in browser        |
+| =M-x org-github-close-issue=     | Close issue/PR on GitHub        |
+| =M-x org-github-add-comment=     | Add comment to issue/PR         |
+| =M-x org-github-create-issue=    | Create issue from Org heading   |
 
-*** Git Analysis
+** Team Dashboard (Optional)
 
-| Command                                | Description                          |
-|----------------------------------------+--------------------------------------|
-| =M-x org-github-extract-time-from-git=   | Find commits referencing issues      |
-| =M-x org-github-estimate-time-from-commits= | Estimate time from commit patterns |
+The =org-github-dashboard= package provides an interactive team dashboard
+built on =org-ql= and =org-super-agenda=.
 
-** Hydra Menu (Optional)
-
-Add a hydra menu for quick access:
+*** Installation
 
 #+begin_src emacs-lisp
-(defhydra hydra-org-github (:color blue :hint nil)
-  "
-GitHub Issues/PRs
-──────────────────────────────────────────
-_i_: Download Issues    _a_: Download All
-_p_: Download PRs       _s_: Full Sync
-_S_: Sync All Repos     _c_: Clock In
-_C_: Clock Out & Log    _v_: View Issue
-_b_: Open in Browser    _x_: Close Issue
-_m_: Add Comment        _n_: Create Issue
-_q_: Quit
-"
-  ("i" org-github-download-issues)
-  ("p" org-github-download-prs)
-  ("a" org-github-download-all)
-  ("s" org-github-full-sync)
-  ("S" org-github-sync-repos)
-  ("c" org-github-clock-in)
-  ("C" org-github-clock-out-and-log)
-  ("v" org-github-view-issue)
-  ("b" org-github-open-in-browser)
-  ("x" org-github-close-issue)
-  ("m" org-github-add-comment)
-  ("n" org-github-create-issue)
-  ("q" nil))
+(use-package org-github-dashboard
+  :after org-github
+  :commands (org-github-dashboard)
+  :bind ("<f4>" . org-github-dashboard))
+#+end_src
+
+*** Features
+
+- Per-assignee sections with open/done issue counts
+- Progress bars showing team completion rates
+- Interactive filtering by repo, assignee, status, and time period
+- Inline sync of individual items from the dashboard
+- Excluded assignees (for departed team members)
+
+*** Dashboard Keybindings
+
+| Key | Action                                   |
+|-----+------------------------------------------|
+| =/=   | Filter by repos, assignees, status, period |
+| =S=   | Sync the item at point from GitHub       |
+
+*** Configuration
+
+#+begin_src emacs-lisp
+;; Exclude departed team members
+(setq org-github-dashboard-excluded-assignees '("former-dev"))
+
+;; Hide assignees with zero items
+(setq org-github-dashboard-hide-empty t)
 #+end_src
 
 ** Issue Format
