@@ -236,6 +236,10 @@ the project owner and number.  Paginates through all project items."
               number
               repository { nameWithOwner }
             }
+            ... on PullRequest {
+              number
+              repository { nameWithOwner }
+            }
           }
           fieldValueByName(name: \"Deadline\") {
             ... on ProjectV2ItemFieldDateValue {
@@ -335,6 +339,7 @@ PRs are created at level 3 (***) to be subtrees under GitHub Issues heading."
          (author (alist-get 'login (alist-get 'author pr)))
          (head-ref (alist-get 'headRefName pr))
          (base-ref (alist-get 'baseRefName pr))
+         (deadline (alist-get 'deadline pr))
          (labels (mapcar (lambda (l) (org-github--sanitize-tag (alist-get 'name l))) (alist-get 'labels pr)))
          (assignees (mapcar (lambda (a) (alist-get 'login a)) (alist-get 'assignees pr)))
          (todo-state (org-github--state-to-todo (if merged "merged" state) 'pr))
@@ -342,6 +347,11 @@ PRs are created at level 3 (***) to be subtrees under GitHub Issues heading."
          (body-text (string-trim body)))
     (concat
      (format "*** %s PR#%d %s %s\n" todo-state number title tags)
+     (if deadline
+         (format "DEADLINE: <%s>\n"
+                 (format-time-string "%Y-%m-%d %a"
+                                     (date-to-time (concat deadline "T00:00:00Z"))))
+       "")
      ":PROPERTIES:\n"
      (format ":PR_NUMBER: %d\n" number)
      (format ":REPO: %s\n" repo)
@@ -584,10 +594,11 @@ Optional ISSUE is the full issue alist for updating metadata like assignees."
                     (org-delete-property "CLOSED_AT")))))
             changed))))))
 
-(defun org-github--update-pr-state (repo number github-state merged &optional pr)
+(defun org-github--update-pr-state (repo number github-state merged &optional pr deadline)
   "Update org-mode TODO state for PR NUMBER from REPO.
 Uses GITHUB-STATE and MERGED timestamp to determine final state.
-Optional PR is the full PR alist for updating timestamps."
+Optional PR is the full PR alist for updating timestamps.
+Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects."
   (let ((pos (org-github--find-pr-heading repo number))
         (org-file (org-github--get-repo-file repo)))
     (when pos
@@ -652,6 +663,14 @@ Optional PR is the full PR alist for updating timestamps."
                     (org-set-property "CLOSED_AT" closed)
                   (when (org-entry-get (point) "CLOSED_AT")
                     (org-delete-property "CLOSED_AT")))))
+            ;; Update DEADLINE if provided
+            (when deadline
+              (org-back-to-heading t)
+              (let ((dl-str (format-time-string "<%Y-%m-%d %a>"
+                                                (date-to-time (concat deadline "T00:00:00Z")))))
+                (unless (string= (or (org-entry-get (point) "DEADLINE") "") dl-str)
+                  (org-deadline nil dl-str)
+                  (setq changed t))))
             changed))))))
 
 ;;; Interactive Commands
@@ -693,11 +712,13 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
 ;;;###autoload
 (defun org-github-sync-pr-states (&optional repo)
   "Sync org-mode states with GitHub for all PRs in REPO.
-Updates existing PRs and adds new ones."
+Updates existing PRs and adds new ones.  When a project mapping
+exists in `org-github-repo-project-alist', also syncs deadlines."
   (interactive)
   (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
                                       nil nil nil nil (car org-github-default-repos))))
          (prs (org-github--fetch-prs repo "all"))
+         (deadlines (org-github--fetch-project-deadlines repo))
          (org-file (org-github--get-repo-file repo))
          (org-github--syncing t)
          (updated-count 0)
@@ -707,13 +728,16 @@ Updates existing PRs and adds new ones."
       (save-restriction
         (widen)
         (dolist (pr prs)
-          (let ((number (alist-get 'number pr))
-                (state (alist-get 'state pr))
-                (merged (alist-get 'mergedAt pr)))
+          (let* ((number (alist-get 'number pr))
+                 (state (alist-get 'state pr))
+                 (merged (alist-get 'mergedAt pr))
+                 (deadline (cdr (assq number deadlines))))
             (if (org-github--pr-exists-p repo number)
-                (when (org-github--update-pr-state repo number state merged pr)
+                (when (org-github--update-pr-state repo number state merged pr deadline)
                   (setq updated-count (1+ updated-count)))
               (goto-char (org-github--find-or-create-repo-heading repo))
+              (when deadline
+                (push (cons 'deadline deadline) pr))
               (insert (org-github--pr-to-org pr repo))
               (setq new-count (1+ new-count)))))
         (save-buffer)))

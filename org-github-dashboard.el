@@ -723,31 +723,6 @@ SINCE-DATE is a \"YYYY-MM-DD\" string.  Returns an alist of
       (maphash (lambda (k v) (push (cons k (nreverse v)) result)) by-assignee)
       (sort result (lambda (a b) (string< (car a) (car b)))))))
 
-(defun org-github-dashboard--fetch-pending-reviews (repos)
-  "Fetch open PRs with pending review requests from REPOS via gh CLI.
-Return an alist of ((REVIEWER . ((:title T :number N :repo R :author A) ...)) ...)."
-  (let ((by-reviewer (make-hash-table :test 'equal)))
-    (dolist (repo repos)
-      (let* ((output (org-github--run-gh-sync
-                      (list "pr" "list" "-R" repo "--state" "open"
-                            "--json" "number,title,reviewRequests,author"
-                            "--limit" "100")))
-             (prs (org-github--parse-json output)))
-        (dolist (pr prs)
-          (let ((requests (alist-get 'reviewRequests pr))
-                (number (alist-get 'number pr))
-                (title (alist-get 'title pr))
-                (author (alist-get 'login (alist-get 'author pr))))
-            (dolist (req requests)
-              (let ((reviewer (alist-get 'login req)))
-                (when reviewer
-                  (push (list :title title :number number
-                              :repo repo :author (or author ""))
-                        (gethash reviewer by-reviewer)))))))))
-    (let ((result nil))
-      (maphash (lambda (k v) (push (cons k (nreverse v)) result)) by-reviewer)
-      (sort result (lambda (a b) (string< (car a) (car b)))))))
-
 (defun org-github-dashboard--format-discord-message (repos &optional target-date since-date)
   "Format a Discord markdown summary for REPOS.
 When TARGET-DATE (a \"YYYY-MM-DD\" string) is given, only include
@@ -864,54 +839,62 @@ show the all-open-items weekly summary."
           (if (zerop total-completed)
               (push "No items completed in this period." lines)
             (push (format "**Total: %d completed**" total-completed) lines))))
-      ;; Pending reviews section (fetched live from GitHub)
-      (let ((by-reviewer (org-github-dashboard--fetch-pending-reviews repos)))
-        (when by-reviewer
-          (let ((total-reviews 0))
-            (push "" lines)
-            (push "---\n## Pending Reviews" lines)
-            (push "" lines)
-            (dolist (entry by-reviewer)
-              (let* ((reviewer (car entry))
-                     (prs (cdr entry)))
-                (cl-incf total-reviews (length prs))
-                (push (format "### %s (%d to review)" reviewer (length prs)) lines)
-                (dolist (pr prs)
-                  (push (format "- PR #%d: %s (by %s)"
-                                (plist-get pr :number)
-                                (plist-get pr :title)
-                                (plist-get pr :author))
-                        lines))
-                (push "" lines)))
-            (push (format "**Total: %d review%s pending**"
-                          total-reviews (if (= total-reviews 1) "" "s"))
-                  lines))))
       (push "" lines)
       (push (format "_Repos: %s_" (string-join (or repos '("all")) ", ")) lines)
       (string-join (nreverse lines) "\n"))))
 
 (defun org-github-dashboard--send-discord-webhook (message)
   "Send MESSAGE to the configured Discord webhook URL.
-Returns non-nil on success."
-  (let* ((url (or org-github-dashboard-discord-webhook-url
-                  (user-error "Set `org-github-dashboard-discord-webhook-url' first")))
-         (url-request-method "POST")
-         (url-request-extra-headers '(("Content-Type" . "application/json")))
-         (payload (json-encode `((content . ,message))))
-         (url-request-data (encode-coding-string payload 'utf-8))
-         (buf (url-retrieve-synchronously url t nil 30)))
-    (when buf
-      (unwind-protect
-          (with-current-buffer buf
-            (goto-char (point-min))
-            (let ((ok (and (re-search-forward "HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
-                           (member (match-string 1) '("200" "204")))))
-              (if ok
-                  (progn (message "Discord message sent successfully.") t)
-                (message "Discord webhook failed: %s"
-                         (buffer-substring (point-min) (min (point-max) 500)))
-                nil)))
-        (kill-buffer buf)))))
+Splits into multiple messages if MESSAGE exceeds Discord's 2000
+character limit.  Returns non-nil on success."
+  (let ((url (or org-github-dashboard-discord-webhook-url
+                 (user-error "Set `org-github-dashboard-discord-webhook-url' first")))
+        (chunks (org-github-dashboard--split-message message 2000))
+        (all-ok t))
+    (dolist (chunk chunks)
+      (let* ((url-request-method "POST")
+             (url-request-extra-headers '(("Content-Type" . "application/json")))
+             (payload (json-encode `((content . ,chunk))))
+             (url-request-data (encode-coding-string payload 'utf-8))
+             (buf (url-retrieve-synchronously url nil nil 30)))
+        (if (null buf)
+            (progn (message "Discord webhook: no response received") (setq all-ok nil))
+          (unwind-protect
+              (with-current-buffer buf
+                (goto-char (point-min))
+                (if (and (re-search-forward "HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                         (member (match-string 1) '("200" "204")))
+                    (message "Discord: sent %d chars" (length chunk))
+                  (goto-char (point-min))
+                  (message "Discord webhook failed: %s"
+                           (buffer-substring (point-min) (min (point-max) 500)))
+                  (setq all-ok nil)))
+            (kill-buffer buf)))))
+    (when all-ok
+      (message "Discord message sent successfully (%d part%s)."
+               (length chunks) (if (= (length chunks) 1) "" "s")))
+    all-ok))
+
+(defun org-github-dashboard--split-message (message max-len)
+  "Split MESSAGE into chunks of at most MAX-LEN characters.
+Splits on newline boundaries to avoid breaking lines."
+  (if (<= (length message) max-len)
+      (list message)
+    (let ((lines (split-string message "\n"))
+          (chunks nil)
+          (current ""))
+      (dolist (line lines)
+        (let ((candidate (if (string-empty-p current)
+                             line
+                           (concat current "\n" line))))
+          (if (<= (length candidate) max-len)
+              (setq current candidate)
+            (when (not (string-empty-p current))
+              (push current chunks))
+            (setq current line))))
+      (when (not (string-empty-p current))
+        (push current chunks))
+      (nreverse chunks))))
 
 ;;;###autoload
 (defun org-github-dashboard-send-discord (target-date since-date)
