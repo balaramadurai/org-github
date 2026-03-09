@@ -110,6 +110,13 @@ Set to nil to include them."
   :type 'boolean
   :group 'org-github-dashboard)
 
+(defcustom org-github-dashboard-discord-hide-pr-linked t
+  "When non-nil, hide issues that have an open PR linked via closing keywords.
+PRs that reference an issue with Fixes/Closes/Resolves #N cause
+that issue to be excluded from the Discord summary."
+  :type 'boolean
+  :group 'org-github-dashboard)
+
 (defcustom org-github-dashboard-discord-webhook-alist nil
   "Alist mapping repository names to Discord webhook URLs.
 Each entry is (REPO . URL).  When set, `org-github-dashboard-send-discord'
@@ -675,6 +682,31 @@ Respect assignee, status, and period filters."
 
 ;;; Discord Integration
 
+(defun org-github-dashboard--issues-with-open-prs (repos)
+  "Return a hash-set of (REPO . ISSUE-NUMBER) pairs that have an open PR.
+Scans open PR body text for closing keywords (Fixes, Closes, Resolves)
+referencing issue numbers."
+  (let* ((org-github-dashboard-repos repos)
+         (query (org-github-dashboard--filtered-issue-query '(todo) '(github-pr)))
+         (linked (make-hash-table :test 'equal))
+         (pr-data (org-ql-select (org-agenda-files) query
+                    :action (lambda ()
+                              (let ((repo (org-entry-get (point) "REPO"))
+                                    (body (org-get-entry)))
+                                (when (and repo body)
+                                  (cons repo body)))))))
+    (dolist (entry (delq nil pr-data))
+      (let ((repo (car entry))
+            (body (cdr entry)))
+        (with-temp-buffer
+          (insert body)
+          (goto-char (point-min))
+          (while (re-search-forward
+                  "\\b\\(?:[Ff]ix\\(?:e[sd]\\)?\\|[Cc]lose[sd]?\\|[Rr]esolve[sd]?\\)\\s-+#\\([0-9]+\\)"
+                  nil t)
+            (puthash (cons repo (string-to-number (match-string 1))) t linked)))))
+    linked))
+
 (defun org-github-dashboard--collect-discord-items (repos target-date)
   "Collect open GitHub items from REPOS due on or before TARGET-DATE.
 TARGET-DATE is a \"YYYY-MM-DD\" string.  Returns an alist of
@@ -684,6 +716,8 @@ Items without a DEADLINE are included under a \"No Deadline\" section
 when they are open."
   (let* ((org-github-dashboard-repos repos)
          (today (format-time-string "%Y-%m-%d"))
+         (pr-linked (when org-github-dashboard-discord-hide-pr-linked
+                      (org-github-dashboard--issues-with-open-prs repos)))
          (query (org-github-dashboard--filtered-issue-query '(todo)))
          (items (org-ql-select (org-agenda-files) query
                   :action (lambda ()
@@ -695,17 +729,20 @@ when they are open."
                                    (dl-raw (org-entry-get (point) "DEADLINE"))
                                    (dl-date (when dl-raw
                                               (org-github-dashboard--date-from-ts dl-raw))))
-                              ;; Include if: has deadline <= target-date, OR has no deadline (unless hidden)
-                              (when (or (and dl-date (not (string< target-date dl-date)))
-                                        (and (null dl-date)
-                                             (not org-github-dashboard-discord-hide-no-deadline)))
-                                (list :title title :repo repo
-                                      :type (if pr-num 'pr 'issue)
-                                      :number (string-to-number (or pr-num iss-num "0"))
-                                      :assignees (when assignees-raw
-                                                   (split-string assignees-raw "," t " +"))
-                                      :deadline dl-date
-                                      :overdue (and dl-date (string< dl-date today))))))))
+                              ;; Skip issues linked to an open PR
+                              (unless (and iss-num pr-linked
+                                           (gethash (cons repo (string-to-number iss-num)) pr-linked))
+                                ;; Include if: has deadline <= target-date, OR has no deadline (unless hidden)
+                                (when (or (and dl-date (not (string< target-date dl-date)))
+                                          (and (null dl-date)
+                                               (not org-github-dashboard-discord-hide-no-deadline)))
+                                  (list :title title :repo repo
+                                        :type (if pr-num 'pr 'issue)
+                                        :number (string-to-number (or pr-num iss-num "0"))
+                                        :assignees (when assignees-raw
+                                                     (split-string assignees-raw "," t " +"))
+                                        :deadline dl-date
+                                        :overdue (and dl-date (string< dl-date today)))))))))
          (by-assignee (make-hash-table :test 'equal)))
     (setq items (delq nil items))
     ;; Skip items with no assignees
