@@ -104,6 +104,36 @@ When nil, `org-github-dashboard-send-discord' will prompt for a URL."
   :type '(choice (const :tag "Not configured" nil) string)
   :group 'org-github-dashboard)
 
+(defcustom org-github-dashboard-discord-hide-no-deadline t
+  "When non-nil, hide issues with no deadline from Discord summaries.
+Set to nil to include them."
+  :type 'boolean
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-discord-webhook-alist nil
+  "Alist mapping repository names to Discord webhook URLs.
+Each entry is (REPO . URL).  When set, `org-github-dashboard-send-discord'
+sends a separate message per repo to its designated webhook.
+Repos not in this alist fall back to `org-github-dashboard-discord-webhook-url'."
+  :type '(alist :key-type string :value-type string)
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-gantt-default-duration 7
+  "Default task duration in days when CREATED_AT is missing.
+Used as a fallback for Gantt chart start dates."
+  :type 'integer
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-report-title "GitHub Project Status Report"
+  "Title for the investor report buffer."
+  :type 'string
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-report-include-gantt t
+  "Whether to embed a Mermaid Gantt chart in the investor report."
+  :type 'boolean
+  :group 'org-github-dashboard)
+
 ;;; org-ql Predicates
 
 (with-eval-after-load 'org-ql
@@ -665,9 +695,10 @@ when they are open."
                                    (dl-raw (org-entry-get (point) "DEADLINE"))
                                    (dl-date (when dl-raw
                                               (org-github-dashboard--date-from-ts dl-raw))))
-                              ;; Include if: has deadline <= target-date, OR has no deadline
+                              ;; Include if: has deadline <= target-date, OR has no deadline (unless hidden)
                               (when (or (and dl-date (not (string< target-date dl-date)))
-                                        (null dl-date))
+                                        (and (null dl-date)
+                                             (not org-github-dashboard-discord-hide-no-deadline)))
                                 (list :title title :repo repo
                                       :type (if pr-num 'pr 'issue)
                                       :number (string-to-number (or pr-num iss-num "0"))
@@ -783,9 +814,9 @@ show the all-open-items weekly summary."
                         (if (= (length items) 1) "" "s"))
                 lines)
           (when overdue
-            (push (format "> :warning: **%d overdue**" (length overdue)) lines)
+            (push (format "> :red_circle: **%d overdue**" (length overdue)) lines)
             (dolist (item overdue)
-              (push (format "- ~~%s~~ %s #%d (was due %s)"
+              (push (format "- :red_circle: **%s** — %s #%d (was due %s)"
                             (plist-get item :title)
                             (if (eq (plist-get item :type) 'pr) "PR" "Issue")
                             (plist-get item :number)
@@ -843,11 +874,20 @@ show the all-open-items weekly summary."
       (push (format "_Repos: %s_" (string-join (or repos '("all")) ", ")) lines)
       (string-join (nreverse lines) "\n"))))
 
-(defun org-github-dashboard--send-discord-webhook (message)
-  "Send MESSAGE to the configured Discord webhook URL.
+(defun org-github-dashboard--webhook-for-repo (repo)
+  "Return the Discord webhook URL for REPO.
+Looks up REPO in `org-github-dashboard-discord-webhook-alist',
+falling back to `org-github-dashboard-discord-webhook-url'."
+  (or (cdr (assoc repo org-github-dashboard-discord-webhook-alist))
+      org-github-dashboard-discord-webhook-url))
+
+(defun org-github-dashboard--send-discord-webhook (message &optional url)
+  "Send MESSAGE to Discord webhook at URL.
+URL defaults to `org-github-dashboard-discord-webhook-url'.
 Splits into multiple messages if MESSAGE exceeds Discord's 2000
 character limit.  Returns non-nil on success."
-  (let ((url (or org-github-dashboard-discord-webhook-url
+  (let ((url (or url
+                 org-github-dashboard-discord-webhook-url
                  (user-error "Set `org-github-dashboard-discord-webhook-url' first")))
         (chunks (org-github-dashboard--split-message message 2000))
         (all-ok t))
@@ -916,17 +956,348 @@ Shows a preview buffer for confirmation before sending."
                       (completing-read-multiple
                        "Repos (comma-separated): " all nil t))))
          (repo-list (if (listp repos) repos (list repos)))
-         (msg (org-github-dashboard--format-discord-message repo-list target-date since-date)))
-    (with-current-buffer (get-buffer-create "*Discord Preview*")
+         (per-repo-p (and org-github-dashboard-discord-webhook-alist
+                          (> (length repo-list) 0))))
+    (if per-repo-p
+        ;; Per-repo mode: separate message per repo, each to its own webhook
+        (let ((preview-parts nil)
+              (send-queue nil))
+          (dolist (repo repo-list)
+            (let ((msg (org-github-dashboard--format-discord-message
+                        (list repo) target-date since-date))
+                  (url (org-github-dashboard--webhook-for-repo repo)))
+              (push (format "--- %s (-> %s) ---\n%s"
+                            repo
+                            (if url (substring url 0 (min 40 (length url))) "NONE")
+                            msg)
+                    preview-parts)
+              (push (cons msg url) send-queue)))
+          (setq preview-parts (nreverse preview-parts))
+          (setq send-queue (nreverse send-queue))
+          (with-current-buffer (get-buffer-create "*Discord Preview*")
+            (erase-buffer)
+            (insert (string-join preview-parts "\n\n"))
+            (goto-char (point-min))
+            (display-buffer (current-buffer)))
+          (when (y-or-n-p (format "Send %d per-repo messages to Discord? "
+                                  (length send-queue)))
+            (dolist (entry send-queue)
+              (org-github-dashboard--send-discord-webhook (car entry) (cdr entry))))
+          (when-let ((win (get-buffer-window "*Discord Preview*")))
+            (delete-window win))
+          (kill-buffer "*Discord Preview*"))
+      ;; Legacy mode: single message to single webhook
+      (let ((msg (org-github-dashboard--format-discord-message
+                  repo-list target-date since-date)))
+        (with-current-buffer (get-buffer-create "*Discord Preview*")
+          (erase-buffer)
+          (insert msg)
+          (goto-char (point-min))
+          (display-buffer (current-buffer)))
+        (when (y-or-n-p "Send this message to Discord? ")
+          (org-github-dashboard--send-discord-webhook msg))
+        (when-let ((win (get-buffer-window "*Discord Preview*")))
+          (delete-window win))
+        (kill-buffer "*Discord Preview*")))))
+
+;;; Mermaid Gantt Chart
+
+(defun org-github-dashboard--gantt-task-id (repo type number)
+  "Create a Mermaid-safe task ID from REPO, TYPE, and NUMBER.
+Replaces slashes, dashes, and other special characters with underscores."
+  (replace-regexp-in-string
+   "[^a-zA-Z0-9_]" "_"
+   (format "%s_%s_%s" repo type number)))
+
+(defun org-github-dashboard--collect-gantt-items ()
+  "Collect task plists for Gantt chart generation.
+Return list of (:title :repo :type :number :state :created :deadline :assignee).
+State is one of `done', `active', or `crit' (open + past deadline).
+Respects all dashboard filters."
+  (let ((today (format-time-string "%Y-%m-%d")))
+    (org-ql-select (org-agenda-files)
+      (org-github-dashboard--filtered-issue-query)
+      :action
+      (lambda ()
+        (let* ((is-pr (org-entry-get (point) "PR_NUMBER"))
+               (number (or is-pr (org-entry-get (point) "ISSUE_NUMBER")))
+               (type (if is-pr "pr" "issue"))
+               (repo (org-entry-get (point) "REPO"))
+               (title (org-get-heading t t t t))
+               (is-done (org-entry-is-done-p))
+               (created-raw (org-entry-get (point) "CREATED_AT"))
+               (deadline-raw (org-entry-get (point) "DEADLINE"))
+               (created (or (org-github-dashboard--date-from-ts created-raw)
+                            (format-time-string
+                             "%Y-%m-%d"
+                             (time-subtract (current-time)
+                                            (days-to-time org-github-dashboard-gantt-default-duration)))))
+               (deadline (or (when deadline-raw
+                               (if (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" deadline-raw)
+                                   (match-string 1 deadline-raw)))
+                             today))
+               (assignees (org-entry-get (point) "ASSIGNEES"))
+               (state (cond
+                       (is-done "done")
+                       ((string< deadline today) "crit")
+                       (t "active"))))
+          (list :title title :repo repo :type type :number number
+                :state state :created created :deadline deadline
+                :assignee (or assignees "")))))))
+
+(defun org-github-dashboard--format-gantt (items)
+  "Build a Mermaid Gantt chart string from ITEMS.
+ITEMS is a list of plists as returned by `--collect-gantt-items'.
+Groups tasks by repository as sections."
+  (let ((grouped (make-hash-table :test 'equal))
+        (repos '())
+        (lines '()))
+    ;; Group items by repo
+    (dolist (item items)
+      (let ((repo (plist-get item :repo)))
+        (unless (gethash repo grouped)
+          (push repo repos))
+        (push item (gethash repo grouped))))
+    (setq repos (nreverse repos))
+    ;; Build Mermaid output
+    (push "gantt" lines)
+    (push "    dateFormat YYYY-MM-DD" lines)
+    (push "    axisFormat %b %d" lines)
+    (dolist (repo repos)
+      (push (format "    section %s" repo) lines)
+      (dolist (item (nreverse (gethash repo grouped)))
+        (let* ((title (plist-get item :title))
+               (truncated (if (> (length title) 30)
+                              (concat (substring title 0 27) "...")
+                            title))
+               (safe-title (replace-regexp-in-string ":" "-" truncated))
+               (id (org-github-dashboard--gantt-task-id
+                    repo (plist-get item :type) (plist-get item :number)))
+               (state (plist-get item :state))
+               (created (plist-get item :created))
+               (deadline (plist-get item :deadline)))
+          (push (format "    %s :%s, %s, %s, %s"
+                        safe-title state id created deadline)
+                lines))))
+    (mapconcat #'identity (nreverse lines) "\n")))
+
+;;;###autoload
+(defun org-github-dashboard-gantt ()
+  "Insert a Mermaid Gantt chart of GitHub tasks at point.
+Respects all dashboard filters (repos, assignees, status).
+The chart is inserted as an org-mode source block."
+  (interactive)
+  (let* ((items (org-github-dashboard--collect-gantt-items))
+         (chart (org-github-dashboard--format-gantt items)))
+    (insert "#+begin_src mermaid\n" chart "\n#+end_src\n")))
+
+;;; Investor Report
+
+(defun org-github-dashboard--collect-repo-stats ()
+  "Collect per-repository statistics.
+Return alist of (REPO . (:open-issues N :open-prs N :done-issues N :done-prs N))."
+  (let ((repos (or org-github-dashboard-repos
+                   (org-github-dashboard--collect-repos))))
+    (mapcar
+     (lambda (repo)
+       (let ((org-github-dashboard-repos (list repo)))
+         (cons repo (org-github-dashboard--collect-all-stats nil))))
+     repos)))
+
+(defun org-github-dashboard--collect-assignee-stats ()
+  "Collect per-assignee statistics.
+Return alist of (ASSIGNEE . (:open-issues N :open-prs N :done-issues N :done-prs N))."
+  (let ((assignees (seq-remove
+                    (lambda (a) (member a org-github-dashboard-excluded-assignees))
+                    (if org-github-dashboard-assignees
+                        org-github-dashboard-assignees
+                      (org-github-dashboard--collect-assignees)))))
+    (mapcar
+     (lambda (name)
+       (cons name (org-github-dashboard--collect-all-stats name)))
+     assignees)))
+
+(defun org-github-dashboard--collect-overdue-items ()
+  "Collect open items with deadline before today.
+Return list of plists (:title :repo :type :number :deadline :assignees)."
+  (let ((today (format-time-string "%Y-%m-%d")))
+    (org-ql-select (org-agenda-files)
+      (org-github-dashboard--filtered-issue-query '(todo) '(deadline :to -1))
+      :action
+      (lambda ()
+        (let* ((is-pr (org-entry-get (point) "PR_NUMBER"))
+               (number (or is-pr (org-entry-get (point) "ISSUE_NUMBER")))
+               (type (if is-pr "PR" "Issue"))
+               (deadline-raw (org-entry-get (point) "DEADLINE"))
+               (deadline (when deadline-raw
+                           (if (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" deadline-raw)
+                               (match-string 1 deadline-raw)
+                             ""))))
+          (list :title (org-get-heading t t t t)
+                :repo (org-entry-get (point) "REPO")
+                :type type
+                :number number
+                :deadline (or deadline "N/A")
+                :assignees (or (org-entry-get (point) "ASSIGNEES") "Unassigned")))))))
+
+(defun org-github-dashboard--collect-upcoming-items (&optional days)
+  "Collect open items with deadline within DAYS (default 14) from today.
+Return list of plists (:title :repo :type :number :deadline :assignees)."
+  (let ((days (or days 14)))
+    (org-ql-select (org-agenda-files)
+      (org-github-dashboard--filtered-issue-query
+       '(todo)
+       `(deadline :from 0 :to ,days))
+      :action
+      (lambda ()
+        (let* ((is-pr (org-entry-get (point) "PR_NUMBER"))
+               (number (or is-pr (org-entry-get (point) "ISSUE_NUMBER")))
+               (type (if is-pr "PR" "Issue"))
+               (deadline-raw (org-entry-get (point) "DEADLINE"))
+               (deadline (when deadline-raw
+                           (if (string-match "\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" deadline-raw)
+                               (match-string 1 deadline-raw)
+                             ""))))
+          (list :title (org-get-heading t t t t)
+                :repo (org-entry-get (point) "REPO")
+                :type type
+                :number number
+                :deadline (or deadline "N/A")
+                :assignees (or (org-entry-get (point) "ASSIGNEES") "Unassigned")))))))
+
+(defun org-github-dashboard--format-investor-report
+    (repo-stats assignee-stats overdue-items upcoming-items gantt-items)
+  "Build an org-mode investor report string.
+REPO-STATS is from `--collect-repo-stats'.
+ASSIGNEE-STATS is from `--collect-assignee-stats'.
+OVERDUE-ITEMS and UPCOMING-ITEMS are plists from their collectors.
+GANTT-ITEMS is from `--collect-gantt-items'."
+  (let ((total-open 0) (total-done 0) (lines '()))
+    ;; Calculate totals
+    (dolist (entry repo-stats)
+      (let ((s (cdr entry)))
+        (cl-incf total-open (+ (plist-get s :open-issues) (plist-get s :open-prs)))
+        (cl-incf total-done (+ (plist-get s :done-issues) (plist-get s :done-prs)))))
+    (let ((total (+ total-open total-done))
+          (rate (if (> (+ total-open total-done) 0)
+                    (/ (* 100.0 total-done) (+ total-open total-done))
+                  0.0)))
+      ;; Title
+      (push (format "#+TITLE: %s" org-github-dashboard-report-title) lines)
+      (push (format "#+DATE: %s" (format-time-string "%Y-%m-%d")) lines)
+      (push "" lines)
+
+      ;; Executive Summary
+      (push "* Executive Summary" lines)
+      (push "" lines)
+      (push "| Metric | Count |" lines)
+      (push "|--------+-------|" lines)
+      (push (format "| Total Items | %d |" total) lines)
+      (push (format "| Open | %d |" total-open) lines)
+      (push (format "| Completed | %d |" total-done) lines)
+      (push (format "| Completion Rate | %.1f%% |" rate) lines)
+      (push (format "| Overdue | %d |" (length overdue-items)) lines)
+      (push (format "| Upcoming (14d) | %d |" (length upcoming-items)) lines)
+      (push "" lines)
+
+      ;; Repository Breakdown
+      (push "* Repository Breakdown" lines)
+      (push "" lines)
+      (push "| Repository | Open Issues | Open PRs | Done Issues | Done PRs | Completion |" lines)
+      (push "|------------+-------------+----------+-------------+----------+------------|" lines)
+      (dolist (entry repo-stats)
+        (let* ((repo (car entry))
+               (s (cdr entry))
+               (oi (plist-get s :open-issues))
+               (op (plist-get s :open-prs))
+               (di (plist-get s :done-issues))
+               (dp (plist-get s :done-prs))
+               (repo-total (+ oi op di dp))
+               (repo-rate (if (> repo-total 0) (/ (* 100.0 (+ di dp)) repo-total) 0.0)))
+          (push (format "| %s | %d | %d | %d | %d | %.1f%% |" repo oi op di dp repo-rate) lines)))
+      (push "" lines)
+
+      ;; Team Workload
+      (push "* Team Workload" lines)
+      (push "" lines)
+      (dolist (entry assignee-stats)
+        (let* ((name (car entry))
+               (s (cdr entry))
+               (open (+ (plist-get s :open-issues) (plist-get s :open-prs)))
+               (done (+ (plist-get s :done-issues) (plist-get s :done-prs))))
+          (push (format "- *%s*: %d open, %d done" name open done) lines)))
+      (push "" lines)
+
+      ;; Overdue Items
+      (push "* Overdue Items" lines)
+      (push "" lines)
+      (if overdue-items
+          (progn
+            (push "| # | Type | Title | Repo | Deadline | Assignees |" lines)
+            (push "|---+------+-------+------+----------+-----------|" lines)
+            (dolist (item overdue-items)
+              (push (format "| %s | %s | %s | %s | %s | %s |"
+                            (plist-get item :number)
+                            (plist-get item :type)
+                            (plist-get item :title)
+                            (plist-get item :repo)
+                            (plist-get item :deadline)
+                            (plist-get item :assignees))
+                    lines)))
+        (push "No overdue items." lines))
+      (push "" lines)
+
+      ;; Upcoming Deadlines
+      (push "* Upcoming Deadlines" lines)
+      (push "" lines)
+      (if upcoming-items
+          (progn
+            (push "| # | Type | Title | Repo | Deadline | Assignees |" lines)
+            (push "|---+------+-------+------+----------+-----------|" lines)
+            (dolist (item upcoming-items)
+              (push (format "| %s | %s | %s | %s | %s | %s |"
+                            (plist-get item :number)
+                            (plist-get item :type)
+                            (plist-get item :title)
+                            (plist-get item :repo)
+                            (plist-get item :deadline)
+                            (plist-get item :assignees))
+                    lines)))
+        (push "No upcoming deadlines." lines))
+      (push "" lines)
+
+      ;; Project Timeline (Gantt)
+      (when org-github-dashboard-report-include-gantt
+        (push "* Project Timeline" lines)
+        (push "" lines)
+        (push "#+begin_src mermaid" lines)
+        (push (org-github-dashboard--format-gantt gantt-items) lines)
+        (push "#+end_src" lines)
+        (push "" lines)))
+
+    (mapconcat #'identity (nreverse lines) "\n")))
+
+;;;###autoload
+(defun org-github-dashboard-investor-report ()
+  "Generate a GitHub investor status report in a new org-mode buffer.
+Collects repository stats, assignee workload, overdue/upcoming items,
+and optionally embeds a Mermaid Gantt chart."
+  (interactive)
+  (let* ((repo-stats (org-github-dashboard--collect-repo-stats))
+         (assignee-stats (org-github-dashboard--collect-assignee-stats))
+         (overdue (org-github-dashboard--collect-overdue-items))
+         (upcoming (org-github-dashboard--collect-upcoming-items))
+         (gantt-items (if org-github-dashboard-report-include-gantt
+                         (org-github-dashboard--collect-gantt-items)
+                       '()))
+         (report (org-github-dashboard--format-investor-report
+                  repo-stats assignee-stats overdue upcoming gantt-items)))
+    (with-current-buffer (get-buffer-create "*GitHub Investor Report*")
       (erase-buffer)
-      (insert msg)
+      (insert report)
+      (org-mode)
       (goto-char (point-min))
-      (display-buffer (current-buffer)))
-    (when (y-or-n-p "Send this message to Discord? ")
-      (org-github-dashboard--send-discord-webhook msg))
-    (when-let ((win (get-buffer-window "*Discord Preview*")))
-      (delete-window win))
-    (kill-buffer "*Discord Preview*")))
+      (pop-to-buffer (current-buffer)))))
 
 (provide 'org-github-dashboard)
 

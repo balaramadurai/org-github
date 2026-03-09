@@ -676,6 +676,148 @@ Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects."
 ;;; Interactive Commands
 
 ;;;###autoload
+(defun org-github-sync-at-point ()
+  "Push local org heading state to GitHub for the issue/PR at point.
+Pure push — reads only local properties and posts them to GitHub.
+No fetching, no overwriting local state.
+Similar to `org-gcal-post-at-point'."
+  (interactive)
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((issue-num (org-entry-get (point) "ISSUE_NUMBER"))
+          (pr-num (org-entry-get (point) "PR_NUMBER"))
+          (repo (org-entry-get (point) "REPO")))
+      (if (and repo (or issue-num pr-num))
+          (let* ((is-pr (not (null pr-num)))
+                 (num (if is-pr pr-num issue-num))
+                 (type (if is-pr "pr" "issue"))
+                 (org-github--syncing t)
+                 (changes '())
+                 ;; Read all local state upfront
+                 (todo-state (org-get-todo-state))
+                 (local-state (org-entry-get (point) "STATE"))
+                 (heading (org-get-heading t t t t))
+                 (title (if (string-match "\\(.*\\) #[0-9]+$" heading)
+                            (match-string 1 heading)
+                          heading))
+                 (deadline-str (org-entry-get (point) "DEADLINE"))
+                 (milestone (org-entry-get (point) "MILESTONE"))
+                 (assignees-str (org-entry-get (point) "ASSIGNEES"))
+                 (local-tags (org-get-tags nil t))
+                 (local-closed (or (string= todo-state org-github-closed-state)
+                                   (string= todo-state org-github-pr-closed-state)
+                                   (string= todo-state org-github-pr-merged-state)))
+                 (stored-closed (member (downcase (or local-state "open"))
+                                        '("closed" "merged"))))
+
+            (message "Posting %s #%s to %s..." type num repo)
+
+            ;; --- 1. Push state (close/reopen) ---
+            (cond
+             ((and local-closed (not stored-closed))
+              (org-github--run-gh-sync (list type "close" num "-R" repo))
+              (org-set-property "STATE" "closed")
+              (org-set-property "UPDATED_AT"
+                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
+              (push "state→closed" changes))
+             ((and (not local-closed) stored-closed)
+              (org-github--run-gh-sync (list type "reopen" num "-R" repo))
+              (org-set-property "STATE" "open")
+              (when (org-entry-get (point) "CLOSED_AT")
+                (org-delete-property "CLOSED_AT"))
+              (org-set-property "UPDATED_AT"
+                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
+              (push "state→open" changes)))
+
+            ;; --- 2. Push title ---
+            (when (and title (not (string-empty-p title)))
+              (org-github--run-gh-sync
+               (list type "edit" num "-R" repo "--title" title))
+              (push "title" changes))
+
+            ;; --- 3. Build single edit command for assignees + labels + milestone ---
+            (let ((edit-args (list type "edit" num "-R" repo)))
+              ;; Assignees: push all local as --add-assignee (idempotent)
+              (when (and assignees-str (not (string-empty-p assignees-str)))
+                (let ((logins (mapcar #'string-trim (split-string assignees-str ","))))
+                  (setq edit-args (append edit-args
+                                          (list "--add-assignee" (string-join logins ","))))
+                  (push "assignees" changes)))
+              ;; Labels: push all local tags as --add-label (idempotent)
+              (when local-tags
+                (setq edit-args (append edit-args
+                                        (list "--add-label" (string-join local-tags ","))))
+                (push "labels" changes))
+              ;; Milestone
+              (if milestone
+                  (progn
+                    (setq edit-args (append edit-args (list "--milestone" milestone)))
+                    (push "milestone" changes))
+                (setq edit-args (append edit-args (list "--remove-milestone"))))
+              ;; Single gh call for all edit fields
+              (org-github--run-gh-sync edit-args))
+
+            ;; --- 4. Push deadline to GitHub Projects V2 ---
+            (when deadline-str
+              (org-github--push-deadline-at-point repo (string-to-number num) deadline-str)
+              (push "deadline" changes))
+
+            (message "Posted %s #%s to %s: %s"
+                     type num repo
+                     (if changes
+                         (string-join (nreverse changes) ", ")
+                       "no changes")))
+        (message "Not on a GitHub issue/PR")))))
+
+(defun org-github--push-deadline-at-point (repo number deadline-str)
+  "Push DEADLINE-STR to GitHub Projects V2 for issue NUMBER in REPO.
+Requires a project mapping in `org-github-repo-project-alist'."
+  (let ((project-config (cdr (assoc repo org-github-repo-project-alist))))
+    (when project-config
+      (let* ((owner (car project-config))
+             (project-num (cdr project-config))
+             ;; Need project/field/item IDs from GraphQL (metadata, not issue content)
+             (query (format "{
+  user(login: \"%s\") {
+    projectV2(number: %d) {
+      id
+      field(name: \"Deadline\") { ... on ProjectV2SingleSelectField { id } ... on ProjectV2Field { id } }
+      items(first: 100) {
+        nodes {
+          id
+          content { ... on Issue { number repository { nameWithOwner } } }
+        }
+      }
+    }
+  }
+}" owner project-num))
+             (json-output (org-github--run-gh-sync
+                           (list "api" "graphql" "-f" (concat "query=" query))))
+             (data (org-github--parse-json json-output))
+             (project-data (alist-get 'projectV2
+                                       (alist-get 'user
+                                                   (alist-get 'data data))))
+             (project-id (alist-get 'id project-data))
+             (field-id (alist-get 'id (alist-get 'field project-data)))
+             (items (alist-get 'nodes (alist-get 'items project-data)))
+             (item-id (cl-loop for item in items
+                               when (let ((content (alist-get 'content item)))
+                                      (and (= (alist-get 'number content) number)
+                                           (string= (alist-get 'nameWithOwner
+                                                                (alist-get 'repository content))
+                                                    repo)))
+                               return (alist-get 'id item))))
+        (when (and project-id field-id item-id)
+          (let ((date (format-time-string "%Y-%m-%d"
+                                          (org-time-string-to-time deadline-str))))
+            (org-github--run-gh-sync
+             (list "project" "item-edit"
+                   "--id" item-id
+                   "--project-id" project-id
+                   "--field-id" field-id
+                   "--date" date))))))))
+
+;;;###autoload
 (defun org-github-sync-issue-states (&optional repo)
   "Sync org-mode states with GitHub for all issues in REPO.
 Updates existing issues and adds new ones.  When a project mapping
