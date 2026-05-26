@@ -163,7 +163,11 @@ Prevents duplicate concurrent async syncs for the same item.")
 Yielding allows timer-based spinner animations to fire during the wait."
   (unless (org-github--gh-available-p)
     (error "GitHub CLI (gh) not found. Install from https://cli.github.com/"))
-  (let* ((buf (generate-new-buffer " *org-github-gh-sync*"))
+  ;; Force a pipe, not a pty: with the default pty, gh detects a terminal and
+  ;; decorates output with ANSI color + a progress spinner, which makes the
+  ;; JSON unparseable (`state` reads as nil -> char-or-string-p crash).
+  (let* ((process-connection-type nil)
+         (buf (generate-new-buffer " *org-github-gh-sync*"))
          (proc (apply #'start-process "org-github-gh" buf "gh" args)))
     (while (process-live-p proc)
       (accept-process-output proc 0.05))
@@ -1563,6 +1567,9 @@ CALLBACK receives (OUTPUT ERROR-STRING) — one will be nil on completion."
        :buffer buf
        :command (cons "gh" args)
        :noquery t
+       ;; Pipe, not pty — keeps gh from emitting ANSI color/spinner that
+       ;; corrupts JSON output (see `org-github--run-gh-sync').
+       :connection-type 'pipe
        :sentinel
        (lambda (proc _event)
          (when (memq (process-status proc) '(exit signal))
