@@ -763,9 +763,12 @@ Returns a time value for comparison, or 0 epoch if nil/unparseable."
     (condition-case nil
         (cond
          ;; Org inactive timestamp: [2025-01-20 Mon 14:22]
+         ;; Written by `org-github--format-time-plain' in LOCAL time, so parse
+         ;; it as local (no trailing Z) to round-trip correctly; otherwise a
+         ;; non-UTC offset makes local look newer/older than it really is.
          ((string-match "\\[\\([0-9-]+\\)\\s-+\\w+\\s-+\\([0-9:]+\\)\\]" timestamp-str)
           (date-to-time (concat (match-string 1 timestamp-str) "T"
-                                (match-string 2 timestamp-str) ":00Z")))
+                                (match-string 2 timestamp-str) ":00")))
          ;; ISO 8601: 2025-01-20T14:22:00Z
          ((string-match "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T" timestamp-str)
           (date-to-time timestamp-str))
