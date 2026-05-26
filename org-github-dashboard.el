@@ -25,13 +25,23 @@
 ;;; Commentary:
 
 ;; org-github-dashboard provides a team dashboard for GitHub issues and PRs
-;; tracked by org-github.  It uses org-ql and org-super-agenda to display
-;; per-assignee progress bars, filterable views by repo/assignee/status/period,
-;; and inline sync of individual items.
+;; tracked by org-github.  It uses org-ql and org-super-agenda to display a
+;; linear drill-down of attention items, per-assignee workloads and milestone
+;; progress, with filterable views by repo/assignee/status/period and inline
+;; sync of individual items.
+;;
+;; Sections are configurable via `org-github-dashboard-sections':
+;;   summary     — team-total progress bar
+;;   attention   — overdue, no-deadline, no-milestone, stale blocks
+;;   assignees   — per-assignee drill-down (open + done)
+;;   milestones  — per-milestone drill-down with progress bars
 ;;
 ;; Usage:
 ;;   M-x org-github-dashboard       — open the dashboard
 ;;   /                               — filter by repos, assignees, status, period
+;;   V d / V w / V m / V a           — view: today / this week / this month / all
+;;   TAB                             — fold / unfold the block at point
+;;   <backtab> (S-TAB)               — cycle: fold all / unfold all
 ;;   S                               — sync the item at point from GitHub
 ;;
 ;; Requirements:
@@ -51,6 +61,9 @@
 (declare-function org-github--parse-json "org-github")
 (declare-function org-github--update-pr-state "org-github")
 (declare-function org-github--update-issue-state "org-github")
+(declare-function org-github-sync-at-point-async "org-github")
+(declare-function org-github--push-deadline-async "org-github")
+(defvar org-github-repo-project-alist)
 
 ;;; Custom Variables
 
@@ -96,6 +109,71 @@ When non-nil, a cons (LABEL . DAYS) limiting items to those
 updated within the last DAYS days.  nil means no time filter."
   :type '(choice (const :tag "All time" nil)
                  (cons :tag "Period" string integer))
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-sections
+  '(summary attention assignees milestones)
+  "Top-level dashboard sections to display, in order.
+Elements: `summary' (team-total bar), `attention' (problem-category
+blocks: overdue, no-deadline, etc.), `assignees' (per-assignee
+drill-down), `milestones' (per-milestone drill-down).  Remove an
+element to hide that section."
+  :type '(repeat (choice (const summary)
+                         (const attention)
+                         (const assignees)
+                         (const milestones)))
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-attention-categories
+  '(overdue no-deadline no-milestone stale)
+  "Problem categories shown in the attention section, in order.
+Each element is one of `overdue', `no-deadline', `no-milestone',
+`stale'.  Remove an element to hide that category."
+  :type '(repeat (choice (const overdue)
+                         (const no-deadline)
+                         (const no-milestone)
+                         (const stale)))
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-stale-days 60
+  "Open issues not updated in this many days are flagged as stale."
+  :type 'integer
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-excluded-milestones nil
+  "List of milestone names to hide from the milestone section.
+Useful for milestones that are closed or no longer active."
+  :type '(repeat string)
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-milestone-include-unassigned nil
+  "When non-nil, include a \"(no milestone)\" block in the milestone section.
+Defaults to nil because the attention section already shows a
+no-milestone block when configured."
+  :type 'boolean
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-summary-show-assignee-bars nil
+  "When non-nil, render per-assignee progress bars in the summary header.
+Restores the pre-v2 layout where each assignee had a compact bar
+below the team total.  The same information lives in the per-assignee
+drill-down section, so this is off by default."
+  :type 'boolean
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-show-section-titles t
+  "When non-nil, show small section titles above each group of blocks
+\(Attention, Assignees, Milestones).  Helps visually distinguish
+sections when several are shown back-to-back."
+  :type 'boolean
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-minimal-style nil
+  "When non-nil, use a minimal rougier-inspired aesthetic.
+Replaces emoji markers in block headers with typographic bullets
+\(●, ·, ─) and applies lighter faces.  When nil, keeps the default
+emoji-rich style."
+  :type 'boolean
   :group 'org-github-dashboard)
 
 (defcustom org-github-dashboard-discord-webhook-url nil
@@ -163,7 +241,17 @@ Used as a fallback for Gantt chart start dates."
                (property "ASSIGNEES")
                (org-entry-get (point) "ASSIGNEES")
                (string-match-p (regexp-quote name)
-                               (org-entry-get (point) "ASSIGNEES")))))
+                               (org-entry-get (point) "ASSIGNEES"))))
+
+  (org-ql-defpred github-stale (days)
+    "A GitHub item whose UPDATED_AT is older than DAYS days ago."
+    :body (let ((ts (org-entry-get (point) "UPDATED_AT")))
+            (when (and ts (>= (length ts) 11))
+              (string< (substring ts 1 11)
+                       (format-time-string
+                        "%Y-%m-%d"
+                        (time-subtract (current-time)
+                                       (days-to-time days))))))))
 
 ;;; org-ql-block sort support (upstream workaround)
 ;; org-ql-block does not expose a :sort option natively.
@@ -259,15 +347,21 @@ TS is like \"[2026-02-15 Sun 14:30]\".  Return nil if invalid."
     (substring ts 1 11)))
 
 (defun org-github-dashboard--filtered-issue-query (&rest extra)
-  "Build a (github-item) query respecting the repo filter.
+  "Build a (github-item) query respecting all active filters.
 EXTRA predicates are ANDed in.  Nil elements in EXTRA are ignored.
-CANCELLED items and excluded assignees are always filtered out."
+Applies: repo filter, excluded assignees, and positive assignee filter
+\(`org-github-dashboard-assignees' — show only items assigned to these people)."
   (let ((repo-pred (org-github-dashboard--repo-query))
         (parts (list '(github-item) '(not (todo "CANCELLED"))))
         (excluded org-github-dashboard-excluded-assignees))
     (when repo-pred (push repo-pred parts))
     (dolist (name excluded)
       (push `(not (github-assignee ,name)) parts))
+    (when org-github-dashboard-assignees
+      (let ((preds (mapcar (lambda (a) `(github-assignee ,a))
+                           org-github-dashboard-assignees)))
+        (push (if (= 1 (length preds)) (car preds) `(or ,@preds))
+              parts)))
     (dolist (e extra) (when e (push e parts)))
     (if (cdr parts) (cons 'and (nreverse parts)) (car parts))))
 
@@ -356,8 +450,152 @@ Respect repo filter and period filter (for done items only)."
                  (org-github-dashboard--period-query)))
               :action 'element-with-markers))))
 
-(defun org-github-dashboard--build-blocks ()
-  "Build org-ql blocks for all discovered GitHub assignees.
+(defun org-github-dashboard--marker (kind)
+  "Return the header prefix string for KIND.
+KIND is one of `overdue', `no-deadline', `no-milestone', `stale',
+`assignee', `unassigned', `milestone'.  When
+`org-github-dashboard-minimal-style' is non-nil, returns a small
+colored bullet; otherwise returns the emoji marker."
+  (if org-github-dashboard-minimal-style
+      (pcase kind
+        ('overdue      (propertize "●" 'face '(:foreground "red3")))
+        ('no-deadline  (propertize "●" 'face '(:foreground "orange3")))
+        ('no-milestone (propertize "●" 'face '(:foreground "gold3")))
+        ('stale        (propertize "●" 'face '(:foreground "gray50")))
+        ('assignee     (propertize "·" 'face '(:foreground "gray60")))
+        ('unassigned   (propertize "·" 'face '(:foreground "orange3")))
+        ('milestone    (propertize "◇" 'face '(:foreground "steel blue"))))
+    (pcase kind
+      ('overdue      "🔴")
+      ('no-deadline  "📅")
+      ('no-milestone "🎯")
+      ('stale        "🕸")
+      ('assignee     "👤")
+      ('unassigned   "❓")
+      ('milestone    "🎯"))))
+
+(defun org-github-dashboard--section-title (label)
+  "Return a small-caps faded section-title string for LABEL."
+  (propertize (format "\n── %s ─────────────────────────────\n\n"
+                      (upcase label))
+              'face '(:foreground "gray55" :weight light :slant italic)))
+
+(defun org-github-dashboard--prepend-section-title (blocks label)
+  "Return BLOCKS with LABEL prepended to the first block's header.
+No-op when BLOCKS is empty or `org-github-dashboard-show-section-titles'
+is nil."
+  (if (and blocks org-github-dashboard-show-section-titles)
+      (let* ((first (car blocks))
+             (settings (nth 2 first))
+             (new-settings
+              (mapcar (lambda (s)
+                        (if (eq (car-safe s) 'org-ql-block-header)
+                            (list 'org-ql-block-header
+                                  (concat (org-github-dashboard--section-title label)
+                                          (cadr s)))
+                          s))
+                      settings)))
+        (cons (list (nth 0 first) (nth 1 first) new-settings)
+              (cdr blocks)))
+    blocks))
+
+(defun org-github-dashboard--collect-milestones ()
+  "Collect unique MILESTONE property values from GitHub items in agenda files.
+Return a sorted list of milestone name strings."
+  (let ((milestones (make-hash-table :test 'equal)))
+    (dolist (file (org-agenda-files))
+      (when (file-exists-p file)
+        (with-current-buffer (find-file-noselect file)
+          (save-excursion
+            (save-restriction
+              (widen)
+              (goto-char (point-min))
+              (while (re-search-forward ":MILESTONE:" nil t)
+                (let ((val (org-entry-get (point) "MILESTONE")))
+                  (when (and val (not (string-empty-p val)))
+                    (puthash val t milestones)))))))))
+    (sort (hash-table-keys milestones) #'string<)))
+
+(defun org-github-dashboard--count-query (query)
+  "Return the number of entries matching QUERY across agenda files."
+  (length (org-ql-select (org-agenda-files) query
+            :action 'element-with-markers)))
+
+(defun org-github-dashboard--build-attention-blocks ()
+  "Build the needs-attention blocks according to `org-github-dashboard-attention-categories'.
+Each category becomes a collapsible org-ql-block grouped by assignee
+within.  Empty categories are skipped."
+  (let ((blocks nil))
+    (dolist (cat org-github-dashboard-attention-categories)
+      (pcase cat
+        ('overdue
+         (let* ((query (org-github-dashboard--filtered-issue-query
+                        '(todo) '(deadline :to -1)))
+                (n (org-github-dashboard--count-query query)))
+           (when (> n 0)
+             (push `(org-ql-block ',query
+                                  ((org-ql-block-header
+                                    ,(format "%s Overdue (%d)"
+                                             (org-github-dashboard--marker 'overdue) n))
+                                   (org-ql-block-sort 'deadline)
+                                   (org-super-agenda-groups
+                                    '((:anything t)))))
+                   blocks))))
+        ('no-deadline
+         (let* ((query (org-github-dashboard--filtered-issue-query
+                        '(todo) '(not (deadline))))
+                (n (org-github-dashboard--count-query query)))
+           (when (> n 0)
+             (push `(org-ql-block ',query
+                                  ((org-ql-block-header
+                                    ,(format "%s No deadline (%d)"
+                                             (org-github-dashboard--marker 'no-deadline) n))
+                                   (org-ql-block-sort 'deadline)
+                                   (org-super-agenda-groups
+                                    '((:anything t)))))
+                   blocks))))
+        ('no-milestone
+         (let* ((query (org-github-dashboard--filtered-issue-query
+                        '(todo) '(not (property "MILESTONE"))))
+                (n (org-github-dashboard--count-query query)))
+           (when (> n 0)
+             (push `(org-ql-block ',query
+                                  ((org-ql-block-header
+                                    ,(format "%s No milestone (%d)"
+                                             (org-github-dashboard--marker 'no-milestone) n))
+                                   (org-ql-block-sort 'deadline)
+                                   (org-super-agenda-groups
+                                    '((:anything t)))))
+                   blocks))))
+        ('stale
+         (let* ((days org-github-dashboard-stale-days)
+                (query (org-github-dashboard--filtered-issue-query
+                        '(todo) `(github-stale ,days)))
+                (n (org-github-dashboard--count-query query)))
+           (when (> n 0)
+             (push `(org-ql-block ',query
+                                  ((org-ql-block-header
+                                    ,(format "%s Stale >%dd (%d)"
+                                             (org-github-dashboard--marker 'stale) days n))
+                                   (org-ql-block-sort 'deadline)
+                                   (org-super-agenda-groups
+                                    '((:anything t)))))
+                   blocks))))))
+    (nreverse blocks)))
+
+(defun org-github-dashboard--assignee-attention-counts (name)
+  "Return plist (:overdue N :no-deadline N) for assignee NAME."
+  (list :overdue
+        (org-github-dashboard--count-query
+         (org-github-dashboard--filtered-issue-query
+          '(todo) `(github-assignee ,name) '(deadline :to -1)))
+        :no-deadline
+        (org-github-dashboard--count-query
+         (org-github-dashboard--filtered-issue-query
+          '(todo) `(github-assignee ,name) '(not (deadline))))))
+
+(defun org-github-dashboard--build-assignee-blocks ()
+  "Build per-assignee drill-down blocks.
 Each assignee gets open issues followed by done issues.
 Respect assignee, status, and period filters."
   (let* ((all-assignees (seq-remove
@@ -378,7 +616,16 @@ Respect assignee, status, and period filters."
       (lambda (name)
         (let* ((s (org-github-dashboard--collect-all-stats name))
                (open-count (+ (plist-get s :open-issues) (plist-get s :open-prs)))
-               (done-count (+ (plist-get s :done-issues) (plist-get s :done-prs))))
+               (done-count (+ (plist-get s :done-issues) (plist-get s :done-prs)))
+               (att (when show-open
+                      (org-github-dashboard--assignee-attention-counts name)))
+               (mk (org-github-dashboard--marker 'assignee))
+               (open-header (if att
+                                (format "%s %s (%d open: %d overdue, %d no-deadline)"
+                                        mk name open-count
+                                        (plist-get att :overdue)
+                                        (plist-get att :no-deadline))
+                              (format "%s %s (%d open)" mk name open-count))))
           (when (or (not org-github-dashboard-hide-empty)
                     (> (+ open-count done-count) 0))
           (append
@@ -387,7 +634,7 @@ Respect assignee, status, and period filters."
                            '(todo) `(github-assignee ,name))))
                (list
                 `(org-ql-block ',query
-                               ((org-ql-block-header ,(format "👤 %s (%d open)" name open-count))
+                               ((org-ql-block-header ,open-header)
                                 (org-ql-block-sort 'deadline)
                                 (org-super-agenda-groups
                                  '((:name "🔴 Overdue" :deadline past)
@@ -400,7 +647,12 @@ Respect assignee, status, and period filters."
                              (org-github-dashboard--period-query)))))
                (list
                 `(org-ql-block ',query
-                               ((org-ql-block-header ,(format "✅ %s (%d done)" name done-count))
+                               ((org-ql-block-header
+                                 ,(format "%s %s (%d done)"
+                                          (if org-github-dashboard-minimal-style
+                                              (propertize "✓" 'face '(:foreground "green4"))
+                                            "✅")
+                                          name done-count))
                                 (org-ql-block-sort 'deadline)
                                 (org-super-agenda-groups
                                  '((:anything t))))))))))))
@@ -416,12 +668,12 @@ Respect assignee, status, and period filters."
                           '(todo) `(and ,@not-clauses))))
               (list
                `(org-ql-block ',query
-                              ((org-ql-block-header ,(format "❓ Unassigned (%d open)" ua-open))
+                              ((org-ql-block-header
+                                ,(format "%s Unassigned (%d open)"
+                                         (org-github-dashboard--marker 'unassigned) ua-open))
                                (org-ql-block-sort 'deadline)
                                (org-super-agenda-groups
-                                '((:name "🔴 Overdue" :deadline past)
-                                  (:name "⏰ Due Soon" :deadline future)
-                                  (:name "📝 No Deadline" :anything t))))))))
+                                '((:anything t))))))))
           (when show-done
             (let ((query (org-github-dashboard--filtered-issue-query
                           '(done) `(and ,@not-clauses)
@@ -429,10 +681,89 @@ Respect assignee, status, and period filters."
                             (org-github-dashboard--period-query)))))
               (list
                `(org-ql-block ',query
-                              ((org-ql-block-header ,(format "✅ Unassigned (%d done)" ua-done))
+                              ((org-ql-block-header
+                                ,(format "%s Unassigned (%d done)"
+                                         (if org-github-dashboard-minimal-style
+                                             (propertize "✓" 'face '(:foreground "green4"))
+                                           "✅")
+                                         ua-done))
                                (org-ql-block-sort 'deadline)
                                (org-super-agenda-groups
                                 '((:anything t))))))))))))))
+
+(defun org-github-dashboard--build-milestone-blocks ()
+  "Build per-milestone drill-down blocks.
+Each milestone gets one collapsible block whose header shows a
+progress bar and counts.  Excluded milestones are skipped.  When
+`org-github-dashboard-milestone-include-unassigned' is non-nil,
+append a block for items with no milestone."
+  (let* ((all (org-github-dashboard--collect-milestones))
+         (milestones (seq-remove
+                      (lambda (m) (member m org-github-dashboard-excluded-milestones))
+                      all))
+         (blocks nil))
+    (dolist (m milestones)
+      (let* ((open-query (org-github-dashboard--filtered-issue-query
+                          '(todo) `(property "MILESTONE" ,m)))
+             (done-query (org-github-dashboard--filtered-issue-query
+                          '(done) `(property "MILESTONE" ,m)))
+             (all-query (org-github-dashboard--filtered-issue-query
+                         `(property "MILESTONE" ,m)))
+             (open-n (org-github-dashboard--count-query open-query))
+             (done-n (org-github-dashboard--count-query done-query))
+             (total (+ open-n done-n))
+             (pct (if (zerop total) 0 (/ (* done-n 100) total)))
+             (bar (org-github-dashboard--progress-bar done-n 0 total 15)))
+        (when (> total 0)
+          (push `(org-ql-block ',all-query
+                               ((org-ql-block-header
+                                 ,(format "%s %s  %s  %d%%  (%d/%d done)"
+                                          (org-github-dashboard--marker 'milestone)
+                                          m bar pct done-n total))
+                                (org-ql-block-sort 'deadline)
+                                (org-super-agenda-groups
+                                 '((:anything t)))))
+                blocks))))
+    (when org-github-dashboard-milestone-include-unassigned
+      (let* ((query (org-github-dashboard--filtered-issue-query
+                     '(todo) '(not (property "MILESTONE"))))
+             (n (org-github-dashboard--count-query query)))
+        (when (> n 0)
+          (push `(org-ql-block ',query
+                               ((org-ql-block-header
+                                 ,(format "%s (no milestone)  %d open"
+                                          (org-github-dashboard--marker 'milestone) n))
+                                (org-ql-block-sort 'deadline)
+                                (org-super-agenda-groups
+                                 '((:anything t)))))
+                blocks))))
+    (nreverse blocks)))
+
+(defun org-github-dashboard--build-blocks ()
+  "Build org-ql blocks for the configured dashboard sections.
+Dispatches on `org-github-dashboard-sections'.  The `summary' section
+is rendered by the header (not an org-ql-block) and is skipped here.
+When `org-github-dashboard-show-section-titles' is non-nil, a small
+section title is prepended to the first block of each section."
+  (let ((blocks nil))
+    (dolist (section org-github-dashboard-sections)
+      (pcase section
+        ('attention
+         (setq blocks (append blocks
+                              (org-github-dashboard--prepend-section-title
+                               (org-github-dashboard--build-attention-blocks)
+                               "Attention"))))
+        ('assignees
+         (setq blocks (append blocks
+                              (org-github-dashboard--prepend-section-title
+                               (org-github-dashboard--build-assignee-blocks)
+                               "Assignees"))))
+        ('milestones
+         (setq blocks (append blocks
+                              (org-github-dashboard--prepend-section-title
+                               (org-github-dashboard--build-milestone-blocks)
+                               "Milestones"))))))
+    blocks))
 
 (defun org-github-dashboard--fixup-done-dates ()
   "Post-process agenda: rewrite \"due Xd ago\" to \"done Xd ago\" on DONE items."
@@ -442,8 +773,24 @@ Respect assignee, status, and period filters."
       (while (re-search-forward "^  DONE .+?\\( due \\([0-9]+d ago\\) \\)" nil t)
         (replace-match " done \\2 " t nil nil 1)))))
 
+(defun org-github-dashboard--restyle-section-titles ()
+  "Re-apply the faded face to \"── SECTION ──\" lines.
+Needed because `org-agenda-structure' overrides the face put on the
+section-title substring when its containing block header is inserted."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "── [A-Z][A-Z]+ ─+" nil t)
+        (add-face-text-property (match-beginning 0) (match-end 0)
+                                '(:foreground "gray55" :weight light
+                                              :slant italic :height 0.9)
+                                nil)))))
+
 (defun org-github-dashboard--insert-summary-header ()
-  "Insert a pictorial summary dashboard at the top of the agenda buffer."
+  "Insert the team-total summary at the top of the agenda buffer.
+Shows the title, active filters, total/open/done counts and the team
+progress bar.  When `org-github-dashboard-summary-show-assignee-bars'
+is non-nil, also renders compact per-assignee bars."
   (let* ((inhibit-read-only t)
          (all-assignees (seq-remove
                          (lambda (a) (member a org-github-dashboard-excluded-assignees))
@@ -452,44 +799,31 @@ Respect assignee, status, and period filters."
                        (seq-filter (lambda (a) (member a org-github-dashboard-assignees))
                                    all-assignees)
                      all-assignees))
-         (bar-width 20)
-         (stats (mapcar (lambda (name)
-                          (let ((s (org-github-dashboard--collect-all-stats name)))
-                            (list name
-                                  (plist-get s :open-issues) (plist-get s :open-prs)
-                                  (plist-get s :done-issues) (plist-get s :done-prs)
-                                  (+ (plist-get s :open-issues) (plist-get s :open-prs)
-                                     (plist-get s :done-issues) (plist-get s :done-prs)))))
-                        assignees))
+         (named-stats (mapcar (lambda (name)
+                                (cons name (org-github-dashboard--collect-all-stats name)))
+                              assignees))
          (unassigned-stats
           (if org-github-dashboard-assignees
               '(:open-issues 0 :open-prs 0 :done-issues 0 :done-prs 0)
             (let ((not-clauses (mapcar (lambda (name) `(not (github-assignee ,name)))
                                        all-assignees)))
               (org-github-dashboard--collect-all-stats nil `(and ,@not-clauses)))))
-         (unassigned-total (+ (plist-get unassigned-stats :open-issues)
-                              (plist-get unassigned-stats :open-prs)
-                              (plist-get unassigned-stats :done-issues)
-                              (plist-get unassigned-stats :done-prs)))
-         (all-stats (if org-github-dashboard-assignees
-                       stats
-                     (append stats (list (list "Unassigned"
-                                               (plist-get unassigned-stats :open-issues)
-                                               (plist-get unassigned-stats :open-prs)
-                                               (plist-get unassigned-stats :done-issues)
-                                               (plist-get unassigned-stats :done-prs)
-                                               unassigned-total)))))
-         (max-name (apply #'max (mapcar (lambda (s) (length (car s))) all-stats)))
-         (total-open-issues (apply #'+ (mapcar (lambda (s) (nth 1 s)) all-stats)))
-         (total-open-prs (apply #'+ (mapcar (lambda (s) (nth 2 s)) all-stats)))
-         (total-done-issues (apply #'+ (mapcar (lambda (s) (nth 3 s)) all-stats)))
-         (total-done-prs (apply #'+ (mapcar (lambda (s) (nth 4 s)) all-stats)))
+         (all-named-stats (if org-github-dashboard-assignees
+                              named-stats
+                            (append named-stats
+                                    (list (cons "Unassigned" unassigned-stats)))))
+         (sum-key (lambda (k)
+                    (apply #'+ (mapcar (lambda (s) (plist-get (cdr s) k))
+                                       all-named-stats))))
+         (total-open-issues (funcall sum-key :open-issues))
+         (total-open-prs (funcall sum-key :open-prs))
+         (total-done-issues (funcall sum-key :done-issues))
+         (total-done-prs (funcall sum-key :done-prs))
          (total-open (+ total-open-issues total-open-prs))
          (total-done (+ total-done-issues total-done-prs))
          (total-all (+ total-open total-done)))
     (save-excursion
       (goto-char (point-min))
-      ;; Title + active filters
       (let ((filters nil))
         (when org-github-dashboard-repos
           (push (format "repos: %s" (string-join org-github-dashboard-repos ", "))
@@ -507,7 +841,6 @@ Respect assignee, status, and period filters."
                                 'face '(:foreground "orange" :slant italic))
                   "")
                 "\n"))
-      ;; Team summary line
       (insert (propertize (format "  Total: %d items  |  %d open  |  %d done  (%d%%)"
                                   total-all total-open total-done
                                   (if (zerop total-all) 0
@@ -523,40 +856,211 @@ Respect assignee, status, and period filters."
               (propertize "█ PRs" 'face '(:foreground "cyan"))
               "  "
               (propertize "░ Open" 'face '(:foreground "gray"))
-              "\n\n")
-      ;; Per-assignee bars
-      (let ((col-bar 22)
-            (col-pct 46)
-            (col-count 52))
-        (dolist (entry all-stats)
-          (let* ((name (nth 0 entry))
-                 (open-i (nth 1 entry))
-                 (open-p (nth 2 entry))
-                 (done-i (nth 3 entry))
-                 (done-p (nth 4 entry))
-                 (total (nth 5 entry))
-                 (done (+ done-i done-p))
-                 (open (+ open-i open-p))
-                 (pct (if (zerop total) 0 (/ (* done 100) total)))
-                 (label (if (string= name "Unassigned")
-                            (propertize name 'face '(:foreground "orange"))
-                          name)))
-            (when (or (not org-github-dashboard-hide-empty)
-                      (> total 0))
-            (insert "  " label
-                    (propertize " " 'display `(space :align-to ,col-bar))
-                    (org-github-dashboard--progress-bar done-i done-p total bar-width)
-                    (if org-github-dashboard-period
-                        (concat
-                         (propertize " " 'display `(space :align-to ,col-pct))
-                         (format "(%d done)" done))
-                      (concat
-                       (propertize " " 'display `(space :align-to ,col-pct))
-                       (format "%3d%%" pct)
-                       (propertize " " 'display `(space :align-to ,col-count))
-                       (format "(%d done, %d open)" done open)))
-                    "\n")))))
+              "\n")
+      (when org-github-dashboard-summary-show-assignee-bars
+        (insert "\n")
+        (let ((col-bar 22)
+              (col-pct 46)
+              (col-count 52)
+              (bar-width 20))
+          (dolist (entry all-named-stats)
+            (let* ((name (car entry))
+                   (s (cdr entry))
+                   (open-i (plist-get s :open-issues))
+                   (open-p (plist-get s :open-prs))
+                   (done-i (plist-get s :done-issues))
+                   (done-p (plist-get s :done-prs))
+                   (total (+ open-i open-p done-i done-p))
+                   (done (+ done-i done-p))
+                   (open (+ open-i open-p))
+                   (pct (if (zerop total) 0 (/ (* done 100) total)))
+                   (label (if (string= name "Unassigned")
+                              (propertize name 'face '(:foreground "orange"))
+                            name)))
+              (when (or (not org-github-dashboard-hide-empty)
+                        (> total 0))
+                (insert "  " label
+                        (propertize " " 'display `(space :align-to ,col-bar))
+                        (org-github-dashboard--progress-bar
+                         done-i done-p total bar-width)
+                        (if org-github-dashboard-period
+                            (concat
+                             (propertize " " 'display `(space :align-to ,col-pct))
+                             (format "(%d done)" done))
+                          (concat
+                           (propertize " " 'display `(space :align-to ,col-pct))
+                           (format "%3d%%" pct)
+                           (propertize " " 'display `(space :align-to ,col-count))
+                           (format "(%d done, %d open)" done open)))
+                        "\n"))))))
       (insert "\n" (make-string 60 ?─) "\n\n"))))
+
+(defun org-github-dashboard--set-period (label days)
+  "Set `org-github-dashboard-period' to (LABEL . DAYS) and refresh the dashboard.
+Pass LABEL as nil to clear the period filter."
+  (setq org-github-dashboard-period (when label (cons label days)))
+  (org-github-dashboard))
+
+(defun org-github-dashboard-view-day ()
+  "Filter the dashboard to items from today only."
+  (interactive)
+  (org-github-dashboard--set-period "today" 0))
+
+(defun org-github-dashboard-view-week ()
+  "Filter the dashboard to items from the current ISO week."
+  (interactive)
+  (org-github-dashboard--set-period
+   "this week" (1- (string-to-number (format-time-string "%u")))))
+
+(defun org-github-dashboard-view-month ()
+  "Filter the dashboard to items from the current calendar month."
+  (interactive)
+  (org-github-dashboard--set-period
+   "this month" (1- (string-to-number (format-time-string "%d")))))
+
+(defun org-github-dashboard-view-all ()
+  "Clear the period filter on the dashboard."
+  (interactive)
+  (org-github-dashboard--set-period nil 0))
+
+;;; Block folding
+
+(defun org-github-dashboard--header-face-p (pos)
+  "Non-nil when POS sits inside an `org-agenda-structure'-faced block header."
+  (let ((face (get-text-property pos 'face)))
+    (or (eq face 'org-agenda-structure)
+        (and (listp face) (memq 'org-agenda-structure face)))))
+
+(defun org-github-dashboard--on-header-line-p ()
+  "Non-nil when the current line is a block header."
+  (save-excursion
+    (beginning-of-line)
+    (or (org-github-dashboard--header-face-p (point))
+        (let ((eol (line-end-position)))
+          (and (< (point) eol)
+               (org-github-dashboard--header-face-p (1+ (point))))))))
+
+(defun org-github-dashboard--current-block-region ()
+  "Return (BODY-START . BODY-END) for the block whose header is on the current line.
+BODY-START is the position right after the header's newline.
+BODY-END is the position of the next block header, or point-max."
+  (save-excursion
+    (beginning-of-line)
+    (when (org-github-dashboard--on-header-line-p)
+      (forward-line 1)
+      (let ((body-start (point))
+            body-end)
+        (while (and (not body-end) (not (eobp)))
+          (if (org-github-dashboard--header-face-p (point))
+              (setq body-end (point))
+            (forward-line 1)))
+        (cons body-start (or body-end (point-max)))))))
+
+(defun org-github-dashboard--block-fold-overlay (start end)
+  "Return the existing fold overlay between START and END, or nil."
+  (cl-find-if (lambda (ov) (overlay-get ov 'org-github-dashboard-fold))
+              (overlays-in start end)))
+
+(defun org-github-dashboard-toggle-fold ()
+  "Toggle folding of the block at point.
+If point is not on a block header line, fall back to
+`org-agenda-goto' so TAB still navigates to the source item."
+  (interactive)
+  (if (not (org-github-dashboard--on-header-line-p))
+      (call-interactively #'org-agenda-goto)
+    (when-let ((region (org-github-dashboard--current-block-region)))
+      (let* ((start (car region))
+             (end (cdr region))
+             (existing (org-github-dashboard--block-fold-overlay start end)))
+        (if existing
+            (delete-overlay existing)
+          (when (> end start)
+            (let ((ov (make-overlay start end nil t nil)))
+              (overlay-put ov 'invisible t)
+              (overlay-put ov 'org-github-dashboard-fold t)
+              (overlay-put ov 'evaporate t))))))))
+
+(defun org-github-dashboard--all-fold-overlays ()
+  "Return all fold overlays currently active in the buffer."
+  (cl-remove-if-not
+   (lambda (ov) (overlay-get ov 'org-github-dashboard-fold))
+   (overlays-in (point-min) (point-max))))
+
+(defun org-github-dashboard-cycle-all ()
+  "Fold all blocks if any are unfolded, otherwise unfold all."
+  (interactive)
+  (let ((overlays (org-github-dashboard--all-fold-overlays)))
+    (if overlays
+        (progn (mapc #'delete-overlay overlays)
+               (message "org-github-dashboard: unfolded all"))
+      (save-excursion
+        (goto-char (point-min))
+        (let ((count 0))
+          (while (not (eobp))
+            (when (org-github-dashboard--on-header-line-p)
+              (org-github-dashboard-toggle-fold)
+              (cl-incf count))
+            (forward-line 1))
+          (message "org-github-dashboard: folded %d block%s"
+                   count (if (= count 1) "" "s")))))))
+
+;;;###autoload
+(defun org-github-dashboard-diagnose ()
+  "Print what the dashboard will render.  For debugging empty sections."
+  (interactive)
+  (let* ((sections org-github-dashboard-sections)
+         (att-cats org-github-dashboard-attention-categories)
+         (period org-github-dashboard-period)
+         (repos org-github-dashboard-repos)
+         (status org-github-dashboard-status)
+         (assignees (seq-remove
+                     (lambda (a) (member a org-github-dashboard-excluded-assignees))
+                     (org-github-dashboard--collect-assignees)))
+         (milestones (seq-remove
+                      (lambda (m) (member m org-github-dashboard-excluded-milestones))
+                      (org-github-dashboard--collect-milestones)))
+         (buf (get-buffer-create "*org-github-dashboard-diagnose*")))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert "=== Filter state ===\n")
+      (insert (format "sections: %S\n" sections))
+      (insert (format "attention-categories: %S\n" att-cats))
+      (insert (format "repos: %S\n" repos))
+      (insert (format "status: %S\n" status))
+      (insert (format "period: %S\n" period))
+      (insert (format "excluded-assignees: %S\n" org-github-dashboard-excluded-assignees))
+      (insert (format "excluded-milestones: %S\n" org-github-dashboard-excluded-milestones))
+      (insert "\n=== Attention counts ===\n")
+      (dolist (cat att-cats)
+        (let* ((q (pcase cat
+                    ('overdue (org-github-dashboard--filtered-issue-query
+                               '(todo) '(deadline :to -1)))
+                    ('no-deadline (org-github-dashboard--filtered-issue-query
+                                   '(todo) '(not (deadline))))
+                    ('no-milestone (org-github-dashboard--filtered-issue-query
+                                    '(todo) '(not (property "MILESTONE"))))
+                    ('stale (org-github-dashboard--filtered-issue-query
+                             '(todo) `(github-stale ,org-github-dashboard-stale-days)))))
+               (n (condition-case err
+                      (org-github-dashboard--count-query q)
+                    (error (format "ERROR: %S" err)))))
+          (insert (format "  %-14s %s   (query: %S)\n" cat n q))))
+      (insert "\n=== Assignees (open count) ===\n")
+      (dolist (a assignees)
+        (let ((n (org-github-dashboard--count-query
+                  (org-github-dashboard--filtered-issue-query
+                   '(todo) `(github-assignee ,a)))))
+          (insert (format "  %-30s %d open\n" a n))))
+      (insert "\n=== Milestones (total count) ===\n")
+      (dolist (m milestones)
+        (let ((n (org-github-dashboard--count-query
+                  (org-github-dashboard--filtered-issue-query
+                   `(property "MILESTONE" ,m)))))
+          (insert (format "  %-50s %d items\n" m n))))
+      (insert (format "\n=== Block list ===\n%d blocks total\n"
+                      (length (org-github-dashboard--build-blocks))))
+      (goto-char (point-min)))
+    (display-buffer buf)))
 
 (defun org-github-dashboard--run (&rest _)
   "Agenda function: build dynamic blocks and run as composite agenda."
@@ -565,10 +1069,28 @@ Respect assignee, status, and period filters."
           (cons `("g!" "GitHub Team Dashboard (dynamic)" ,blocks)
                 (assoc-delete-all "g!" org-agenda-custom-commands)))
     (org-agenda-run-series "GitHub Team Dashboard" (list blocks))
-    (org-github-dashboard--insert-summary-header)
+    (when (memq 'summary org-github-dashboard-sections)
+      (org-github-dashboard--insert-summary-header))
     (org-github-dashboard--fixup-done-dates)
+    (org-github-dashboard--restyle-section-titles)
     (local-set-key (kbd "/") #'org-github-dashboard-toggle-filter)
-    (local-set-key (kbd "S") #'org-github-dashboard-sync-item)))
+    (local-set-key (kbd "S") #'org-github-dashboard-sync-item)
+    (local-set-key (kbd "s-z H P") #'org-github-dashboard-sync-item)
+    (local-set-key (kbd "C-d") #'org-github-dashboard-set-deadline)
+    (local-set-key (kbd "V d") #'org-github-dashboard-view-day)
+    (local-set-key (kbd "V w") #'org-github-dashboard-view-week)
+    (local-set-key (kbd "V m") #'org-github-dashboard-view-month)
+    (local-set-key (kbd "V a") #'org-github-dashboard-view-all)
+    (local-set-key (kbd "TAB") #'org-github-dashboard-toggle-fold)
+    (local-set-key (kbd "<tab>") #'org-github-dashboard-toggle-fold)
+    (local-set-key [tab] #'org-github-dashboard-toggle-fold)
+    (local-set-key (kbd "<backtab>") #'org-github-dashboard-cycle-all)
+    (local-set-key (kbd "S-TAB") #'org-github-dashboard-cycle-all)
+    (local-set-key [backtab] #'org-github-dashboard-cycle-all)
+    (local-set-key [S-tab] #'org-github-dashboard-cycle-all)
+    (goto-char (point-min))
+    (when (get-buffer-window (current-buffer))
+      (set-window-start (get-buffer-window (current-buffer)) (point-min)))))
 
 ;;; Interactive Commands
 
@@ -635,43 +1157,70 @@ Respect assignee, status, and period filters."
 
 ;;;###autoload
 (defun org-github-dashboard-sync-item ()
-  "Sync the issue or PR at point in the dashboard from GitHub."
+  "Asynchronously sync the issue or PR at point in the dashboard.
+Fetches from GitHub without blocking Emacs, then refreshes the dashboard
+when done.  With \\[universal-argument], force-pull; with \\[universal-argument] \\[universal-argument], force-push."
+  (interactive)
+  (let* ((marker (or (org-get-at-bol 'org-hd-marker)
+                     (org-agenda-error)))
+         (agenda-buf (current-buffer)))
+    (with-current-buffer (marker-buffer marker)
+      (save-excursion
+        (goto-char (marker-position marker))
+        (org-github-sync-at-point-async
+         current-prefix-arg
+         (lambda (_error)
+           (when (buffer-live-p agenda-buf)
+             (with-current-buffer agenda-buf
+               (org-agenda-redo t)))))))))
+
+;;;###autoload
+(defun org-github-dashboard-set-deadline ()
+  "Set or remove the deadline for the item at point.
+Uses the standard Org date picker.  If the item belongs to a configured
+GitHub Projects V2 board, the deadline is also pushed there asynchronously
+after the dashboard refreshes."
   (interactive)
   (let* ((marker (or (org-get-at-bol 'org-hd-marker)
                      (org-agenda-error)))
          (buf (marker-buffer marker))
          (pos (marker-position marker))
-         repo number is-pr)
+         (agenda-buf (current-buffer)))
+    ;; Set deadline interactively in the source org buffer
     (with-current-buffer buf
       (save-excursion
         (goto-char pos)
-        (org-back-to-heading t)
-        (setq repo (org-entry-get (point) "REPO"))
-        (setq number (or (org-entry-get (point) "PR_NUMBER")
-                         (org-entry-get (point) "ISSUE_NUMBER")))
-        (setq is-pr (not (null (org-entry-get (point) "PR_NUMBER"))))))
-    (unless (and repo number)
-      (user-error "No REPO/ISSUE_NUMBER/PR_NUMBER properties found at point"))
-    (setq number (string-to-number number))
-    (message "Syncing %s #%d from %s..." (if is-pr "PR" "issue") number repo)
-    (let* ((json-fields (if is-pr
-                            "number,state,updatedAt,closedAt,mergedAt,labels,assignees"
-                          "number,state,updatedAt,closedAt,labels,assignees,milestone"))
-           (gh-cmd (if is-pr "pr" "issue"))
-           (output (org-github--run-gh-sync
-                    (list gh-cmd "view" (number-to-string number)
-                          "-R" repo "--json" json-fields)))
-           (data (org-github--parse-json output)))
-      (if is-pr
-          (let ((state (alist-get 'state data))
-                (merged (alist-get 'mergedAt data)))
-            (org-github--update-pr-state repo number state merged data)
-            (message "Synced PR #%d from %s: %s" number repo
-                     (if merged "merged" state)))
-        (let ((state (alist-get 'state data)))
-          (org-github--update-issue-state repo number state nil data)
-          (message "Synced issue #%d from %s: %s" number repo state))))
-    (org-agenda-redo t)))
+        (call-interactively #'org-deadline)))
+    ;; Capture updated deadline and item identifiers after the picker closes
+    (let* ((deadline-str (with-current-buffer buf
+                           (save-excursion (goto-char pos)
+                                           (org-entry-get (point) "DEADLINE"))))
+           (repo (with-current-buffer buf
+                   (save-excursion (goto-char pos)
+                                   (org-entry-get (point) "REPO"))))
+           (num-str (with-current-buffer buf
+                      (save-excursion (goto-char pos)
+                                      (or (org-entry-get (point) "ISSUE_NUMBER")
+                                          (org-entry-get (point) "PR_NUMBER"))))))
+      ;; Defer the dashboard redo slightly so Emacs can redisplay first
+      (run-with-idle-timer
+       0.05 nil
+       (lambda ()
+         (when (buffer-live-p agenda-buf)
+           (with-current-buffer agenda-buf
+             (org-agenda-redo t)))))
+      ;; Push deadline to GitHub Projects V2 if configured
+      (when (and deadline-str repo num-str
+                 (assoc repo org-github-repo-project-alist))
+        (let ((num (string-to-number num-str)))
+          (when (> num 0)
+            (message "Pushing deadline to GitHub Projects V2...")
+            (org-github--push-deadline-async
+             repo num deadline-str
+             (lambda (err)
+               (if err
+                   (message "org-github: deadline push failed: %s" err)
+                 (message "Deadline pushed to GitHub Projects V2"))))))))))
 
 ;;;###autoload
 (defun org-github-dashboard ()
@@ -918,39 +1467,51 @@ falling back to `org-github-dashboard-discord-webhook-url'."
   (or (cdr (assoc repo org-github-dashboard-discord-webhook-alist))
       org-github-dashboard-discord-webhook-url))
 
+(defun org-github-dashboard--send-chunks-async (chunks url done-callback)
+  "Send CHUNKS sequentially to Discord webhook URL, async.
+DONE-CALLBACK receives t on full success or nil on any failure."
+  (if (null chunks)
+      (funcall done-callback t)
+    (let* ((url-request-method "POST")
+           (url-request-extra-headers '(("Content-Type" . "application/json")))
+           (payload (json-encode `((content . ,(car chunks)))))
+           (url-request-data (encode-coding-string payload 'utf-8)))
+      (url-retrieve
+       url
+       (lambda (status &rest _)
+         (unwind-protect
+             (if (plist-get status :error)
+                 (progn
+                   (message "Discord webhook error: %s" (plist-get status :error))
+                   (funcall done-callback nil))
+               (goto-char (point-min))
+               (if (and (re-search-forward "HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                        (member (match-string 1) '("200" "204")))
+                   (progn
+                     (message "Discord: sent %d chars" (length (car chunks)))
+                     (org-github-dashboard--send-chunks-async
+                      (cdr chunks) url done-callback))
+                 (message "Discord webhook failed: %s"
+                          (buffer-substring (point-min) (min (point-max) 500)))
+                 (funcall done-callback nil)))
+           (kill-buffer (current-buffer))))
+       nil t))))
+
 (defun org-github-dashboard--send-discord-webhook (message &optional url)
   "Send MESSAGE to Discord webhook at URL.
 URL defaults to `org-github-dashboard-discord-webhook-url'.
 Splits into multiple messages if MESSAGE exceeds Discord's 2000
-character limit.  Returns non-nil on success."
+character limit.  Sends asynchronously and returns immediately."
   (let ((url (or url
                  org-github-dashboard-discord-webhook-url
                  (user-error "Set `org-github-dashboard-discord-webhook-url' first")))
-        (chunks (org-github-dashboard--split-message message 2000))
-        (all-ok t))
-    (dolist (chunk chunks)
-      (let* ((url-request-method "POST")
-             (url-request-extra-headers '(("Content-Type" . "application/json")))
-             (payload (json-encode `((content . ,chunk))))
-             (url-request-data (encode-coding-string payload 'utf-8))
-             (buf (url-retrieve-synchronously url nil nil 30)))
-        (if (null buf)
-            (progn (message "Discord webhook: no response received") (setq all-ok nil))
-          (unwind-protect
-              (with-current-buffer buf
-                (goto-char (point-min))
-                (if (and (re-search-forward "HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
-                         (member (match-string 1) '("200" "204")))
-                    (message "Discord: sent %d chars" (length chunk))
-                  (goto-char (point-min))
-                  (message "Discord webhook failed: %s"
-                           (buffer-substring (point-min) (min (point-max) 500)))
-                  (setq all-ok nil)))
-            (kill-buffer buf)))))
-    (when all-ok
-      (message "Discord message sent successfully (%d part%s)."
-               (length chunks) (if (= (length chunks) 1) "" "s")))
-    all-ok))
+        (chunks (org-github-dashboard--split-message message 2000)))
+    (org-github-dashboard--send-chunks-async
+     chunks url
+     (lambda (ok)
+       (when ok
+         (message "Discord message sent successfully (%d part%s)."
+                  (length chunks) (if (= (length chunks) 1) "" "s")))))))
 
 (defun org-github-dashboard--split-message (message max-len)
   "Split MESSAGE into chunks of at most MAX-LEN characters.

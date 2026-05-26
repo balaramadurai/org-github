@@ -138,22 +138,42 @@ When set, deadlines from the project board are synced as Org DEADLINE."
                 :value-type (cons string integer))
   :group 'org-github)
 
+(defcustom org-github-project-deadlines-cache-ttl 300
+  "Seconds before cached GitHub Projects V2 deadlines are considered stale.
+Set to 0 to disable caching and always fetch from GitHub."
+  :type 'integer
+  :group 'org-github)
+
 ;;; Internal Functions
+
+(defvar org-github--project-deadlines-cache (make-hash-table :test 'equal)
+  "Cache for GitHub Projects V2 deadline data, keyed by repo string.
+Each value is (FETCH-TIME . DEADLINES-ALIST).")
+
+(defvar org-github--active-syncs (make-hash-table :test 'equal)
+  "Hash table of (REPO . NUM-STR) keys for syncs currently in progress.
+Prevents duplicate concurrent async syncs for the same item.")
 
 (defun org-github--gh-available-p ()
   "Check if gh CLI is available."
   (executable-find "gh"))
 
 (defun org-github--run-gh-sync (args)
-  "Run gh CLI with ARGS synchronously.
-Returns the output string on success, signals error on failure."
+  "Run gh CLI with ARGS, blocking until done but yielding to the event loop.
+Yielding allows timer-based spinner animations to fire during the wait."
   (unless (org-github--gh-available-p)
     (error "GitHub CLI (gh) not found. Install from https://cli.github.com/"))
-  (with-temp-buffer
-    (let ((exit-code (apply #'call-process "gh" nil t nil args)))
-      (if (zerop exit-code)
-          (buffer-string)
-        (error "gh failed: %s" (buffer-string))))))
+  (let* ((buf (generate-new-buffer " *org-github-gh-sync*"))
+         (proc (apply #'start-process "org-github-gh" buf "gh" args)))
+    (while (process-live-p proc)
+      (accept-process-output proc 0.05))
+    (with-current-buffer buf
+      (let ((exit-code (process-exit-status proc))
+            (output (buffer-string)))
+        (kill-buffer buf)
+        (if (zerop exit-code)
+            output
+          (error "gh failed: %s" output))))))
 
 (defun org-github--parse-json (json-string)
   "Parse JSON-STRING into elisp data structures."
@@ -205,27 +225,42 @@ STATE can be \"open\", \"closed\", \"merged\", or \"all\" (default)."
          (json-output (org-github--run-gh-sync
                        (list "pr" "list" "-R" repo
                              "--state" state-arg
-                             "--json" "number,title,body,state,createdAt,updatedAt,closedAt,mergedAt,labels,assignees,url,author,headRefName,baseRefName"
+                             "--json" "number,title,body,state,createdAt,updatedAt,closedAt,mergedAt,labels,assignees,milestone,url,author,headRefName,baseRefName"
                              "--limit" "1000"))))
     (org-github--parse-json json-output)))
+
+(defun org-github-clear-project-deadlines-cache ()
+  "Clear cached GitHub Projects V2 deadline data for all repos."
+  (interactive)
+  (clrhash org-github--project-deadlines-cache)
+  (message "org-github: project deadlines cache cleared"))
 
 (defun org-github--fetch-project-deadlines (repo)
   "Fetch deadline field values from GitHub Projects V2 for REPO.
 Returns an alist of (ISSUE-NUMBER . \"YYYY-MM-DD\") for issues that have
 a Deadline field set.  Uses `org-github-repo-project-alist' to find
-the project owner and number.  Paginates through all project items."
-  (let ((project-config (cdr (assoc repo org-github-repo-project-alist))))
-    (when project-config
-      (let* ((owner (car project-config))
-             (project-num (cdr project-config))
-             (deadlines '())
-             (has-next t)
-             (cursor nil))
-        (while has-next
-          (let* ((after-clause (if cursor
-                                   (format "after: \"%s\"" cursor)
-                                 ""))
-                 (query (format "{
+the project owner and number.  Paginates through all project items.
+Results are cached for `org-github-project-deadlines-cache-ttl' seconds."
+  (let* ((entry (gethash repo org-github--project-deadlines-cache))
+         (fetch-time (car entry))
+         (cached-deadlines (cdr entry)))
+    (if (and (> org-github-project-deadlines-cache-ttl 0)
+             fetch-time
+             (< (float-time (time-subtract (current-time) fetch-time))
+                org-github-project-deadlines-cache-ttl))
+        cached-deadlines
+      (let ((project-config (cdr (assoc repo org-github-repo-project-alist))))
+        (when project-config
+          (let* ((owner (car project-config))
+                 (project-num (cdr project-config))
+                 (deadlines '())
+                 (has-next t)
+                 (cursor nil))
+            (while has-next
+              (let* ((after-clause (if cursor
+                                       (format "after: \"%s\"" cursor)
+                                     ""))
+                     (query (format "{
   user(login: \"%s\") {
     projectV2(number: %d) {
       items(first: 100 %s) {
@@ -251,27 +286,30 @@ the project owner and number.  Paginates through all project items."
     }
   }
 }" owner project-num after-clause))
-                 (json-output (org-github--run-gh-sync
-                               (list "api" "graphql" "-f" (concat "query=" query))))
-                 (data (org-github--parse-json json-output))
-                 (items (alist-get 'items
-                                   (alist-get 'projectV2
-                                              (alist-get 'user
-                                                         (alist-get 'data data)))))
-                 (page-info (alist-get 'pageInfo items))
-                 (nodes (alist-get 'nodes items)))
-            (dolist (node nodes)
-              (let* ((content (alist-get 'content node))
-                     (number (alist-get 'number content))
-                     (node-repo (alist-get 'nameWithOwner (alist-get 'repository content)))
-                     (deadline-field (alist-get 'fieldValueByName node))
-                     (date (when deadline-field (alist-get 'date deadline-field))))
-                (when (and number date (string= node-repo repo))
-                  (push (cons number date) deadlines))))
-            (setq has-next (eq (alist-get 'hasNextPage page-info) t))
-            (setq cursor (alist-get 'endCursor page-info))))
-        (message "Fetched %d deadlines from project for %s" (length deadlines) repo)
-        deadlines))))
+                     (json-output (org-github--run-gh-sync
+                                   (list "api" "graphql" "-f" (concat "query=" query))))
+                     (data (org-github--parse-json json-output))
+                     (items (alist-get 'items
+                                       (alist-get 'projectV2
+                                                  (alist-get 'user
+                                                             (alist-get 'data data)))))
+                     (page-info (alist-get 'pageInfo items))
+                     (nodes (alist-get 'nodes items)))
+                (dolist (node nodes)
+                  (let* ((content (alist-get 'content node))
+                         (number (alist-get 'number content))
+                         (node-repo (alist-get 'nameWithOwner (alist-get 'repository content)))
+                         (deadline-field (alist-get 'fieldValueByName node))
+                         (date (when deadline-field (alist-get 'date deadline-field))))
+                    (when (and number date (string= node-repo repo))
+                      (push (cons number date) deadlines))))
+                (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+                (setq cursor (alist-get 'endCursor page-info))))
+            (when (> org-github-project-deadlines-cache-ttl 0)
+              (puthash repo (cons (current-time) deadlines)
+                       org-github--project-deadlines-cache))
+            (message "Fetched %d deadlines from project for %s" (length deadlines) repo)
+            deadlines))))))
 
 (defun org-github--sanitize-tag (name)
   "Sanitize GitHub label NAME for use as an Org tag.
@@ -342,6 +380,7 @@ PRs are created at level 3 (***) to be subtrees under GitHub Issues heading."
          (deadline (alist-get 'deadline pr))
          (labels (mapcar (lambda (l) (org-github--sanitize-tag (alist-get 'name l))) (alist-get 'labels pr)))
          (assignees (mapcar (lambda (a) (alist-get 'login a)) (alist-get 'assignees pr)))
+         (milestone (alist-get 'title (alist-get 'milestone pr)))
          (todo-state (org-github--state-to-todo (if merged "merged" state) 'pr))
          (tags (concat ":PR:" (if labels (concat (string-join labels ":") ":") "")))
          (body-text (string-trim body)))
@@ -365,6 +404,7 @@ PRs are created at level 3 (***) to be subtrees under GitHub Issues heading."
      (if merged (format ":MERGED_AT: %s\n" (org-github--format-time-plain merged)) "")
      (if closed (format ":CLOSED_AT: %s\n" (org-github--format-time-plain closed)) "")
      (if assignees (format ":ASSIGNEES: %s\n" (string-join assignees ", ")) "")
+     (if milestone (format ":MILESTONE: %s\n" milestone) "")
      ":END:\n"
      (if (string-empty-p body-text) "" (concat "\n" body-text "\n"))
      "\n")))
@@ -555,11 +595,11 @@ Optional ISSUE is the full issue alist for updating metadata like assignees."
                       (org-set-property "ASSIGNEES" new-assignees)
                     (org-delete-property "ASSIGNEES"))
                   (setq changed t)))
-              ;; Sync labels as tags
+              ;; Sync labels as tags (sanitized for Org) + GITHUB_LABELS (raw names for push)
               (org-back-to-heading t)
-              (let* ((labels (mapcar (lambda (l)
-                                       (org-github--sanitize-tag (alist-get 'name l)))
-                                     (alist-get 'labels issue)))
+              (let* ((raw-labels (mapcar (lambda (l) (alist-get 'name l))
+                                         (alist-get 'labels issue)))
+                     (labels (mapcar #'org-github--sanitize-tag raw-labels))
                      (new-tags (if labels (concat ":" (string-join labels ":") ":") nil))
                      (current-tags (org-get-tags nil t))
                      (current-tag-str (if current-tags
@@ -569,7 +609,13 @@ Optional ISSUE is the full issue alist for updating metadata like assignees."
                   (if labels
                       (org-set-tags (string-join labels ":"))
                     (org-set-tags nil))
-                  (setq changed t)))
+                  (setq changed t))
+                (let ((labels-str (string-join raw-labels ",")))
+                  (unless (equal labels-str (org-entry-get (point) "GITHUB_LABELS"))
+                    (if raw-labels
+                        (org-set-property "GITHUB_LABELS" labels-str)
+                      (org-delete-property "GITHUB_LABELS"))
+                    (setq changed t))))
               ;; Sync milestone
               (org-back-to-heading t)
               (let* ((milestone (alist-get 'title (alist-get 'milestone issue)))
@@ -636,11 +682,11 @@ Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects."
                       (org-set-property "ASSIGNEES" new-assignees)
                     (org-delete-property "ASSIGNEES"))
                   (setq changed t)))
-              ;; Sync labels as tags
+              ;; Sync labels as tags (sanitized for Org) + GITHUB_LABELS (raw names for push)
               (org-back-to-heading t)
-              (let* ((labels (mapcar (lambda (l)
-                                       (org-github--sanitize-tag (alist-get 'name l)))
-                                     (alist-get 'labels pr)))
+              (let* ((raw-labels (mapcar (lambda (l) (alist-get 'name l))
+                                         (alist-get 'labels pr)))
+                     (labels (mapcar #'org-github--sanitize-tag raw-labels))
                      (new-tags (if labels (concat ":" (string-join labels ":") ":") nil))
                      (current-tags (org-get-tags nil t))
                      (current-tag-str (if current-tags
@@ -650,6 +696,22 @@ Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects."
                   (if labels
                       (org-set-tags (string-join labels ":"))
                     (org-set-tags nil))
+                  (setq changed t))
+                (let ((labels-str (string-join raw-labels ",")))
+                  (unless (equal labels-str (org-entry-get (point) "GITHUB_LABELS"))
+                    (if raw-labels
+                        (org-set-property "GITHUB_LABELS" labels-str)
+                      (org-delete-property "GITHUB_LABELS"))
+                    (setq changed t))))
+              ;; Sync milestone
+              (org-back-to-heading t)
+              (let* ((milestone (alist-get 'title (alist-get 'milestone pr)))
+                     (current-milestone (org-entry-get (point) "MILESTONE")))
+                (when (not (equal milestone current-milestone))
+                  (if milestone
+                      (org-set-property "MILESTONE" milestone)
+                    (when current-milestone
+                      (org-delete-property "MILESTONE")))
                   (setq changed t)))
               ;; Sync timestamps
               (org-back-to-heading t)
@@ -675,99 +737,234 @@ Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects."
 
 ;;; Interactive Commands
 
+(defun org-github--fetch-single-issue (repo number)
+  "Fetch a single issue NUMBER from REPO via gh CLI.
+Returns the parsed alist or nil on failure."
+  (let ((json-output (org-github--run-gh-sync
+                      (list "issue" "view" (number-to-string number)
+                            "-R" repo
+                            "--json" "number,title,body,state,createdAt,updatedAt,closedAt,labels,assignees,milestone,url,author"))))
+    (org-github--parse-json json-output)))
+
+(defun org-github--fetch-single-pr (repo number)
+  "Fetch a single PR NUMBER from REPO via gh CLI.
+Returns the parsed alist or nil on failure."
+  (let ((json-output (org-github--run-gh-sync
+                      (list "pr" "view" (number-to-string number)
+                            "-R" repo
+                            "--json" "number,title,body,state,createdAt,updatedAt,closedAt,mergedAt,labels,assignees,milestone,url,author,headRefName,baseRefName"))))
+    (org-github--parse-json json-output)))
+
+(defun org-github--parse-updated-at (timestamp-str)
+  "Parse TIMESTAMP-STR from either Org inactive format or ISO 8601.
+Returns a time value for comparison, or 0 epoch if nil/unparseable."
+  (if (or (null timestamp-str) (string-empty-p timestamp-str))
+      (encode-time 0 0 0 1 1 1970)
+    (condition-case nil
+        (cond
+         ;; Org inactive timestamp: [2025-01-20 Mon 14:22]
+         ((string-match "\\[\\([0-9-]+\\)\\s-+\\w+\\s-+\\([0-9:]+\\)\\]" timestamp-str)
+          (date-to-time (concat (match-string 1 timestamp-str) "T"
+                                (match-string 2 timestamp-str) ":00Z")))
+         ;; ISO 8601: 2025-01-20T14:22:00Z
+         ((string-match "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T" timestamp-str)
+          (date-to-time timestamp-str))
+         (t (encode-time 0 0 0 1 1 1970)))
+      (error (encode-time 0 0 0 1 1 1970)))))
+
+(defun org-github--fetch-single-deadline (repo number)
+  "Fetch the deadline for item NUMBER in REPO from GitHub Projects V2.
+Returns a \"YYYY-MM-DD\" string or nil.  Skips fetch if no project
+is configured for REPO in `org-github-repo-project-alist'."
+  (when (assoc repo org-github-repo-project-alist)
+    (cdr (assq number (org-github--fetch-project-deadlines repo)))))
+
+(defun org-github--pull-at-point (repo num type remote-data)
+  "Pull remote data for TYPE item NUM in REPO into org heading at point.
+NUM must be an integer.  REMOTE-DATA is the parsed alist from GitHub.
+Updates the heading in place using the existing update functions."
+  (let* ((org-github--syncing t)
+         (deadline (org-github--fetch-single-deadline repo num)))
+    (if (string= type "issue")
+        (let ((github-state (alist-get 'state remote-data)))
+          (org-github--update-issue-state repo num
+                                          (downcase github-state) deadline remote-data))
+      ;; PR
+      (let ((github-state (alist-get 'state remote-data))
+            (merged (alist-get 'mergedAt remote-data)))
+        (org-github--update-pr-state repo num
+                                     (downcase github-state) merged remote-data deadline)))))
+
+(defun org-github--push-at-point (repo num type &optional remote-data)
+  "Push local org heading state to GitHub for TYPE item NUM in REPO.
+Reads local properties and posts them to GitHub.
+REMOTE-DATA, if provided, is used to skip pushes when values are unchanged."
+  (let* ((org-github--syncing t)
+         (changes '())
+         (todo-state (org-get-todo-state))
+         (local-state (org-entry-get (point) "STATE"))
+         (heading (org-get-heading t t t t))
+         (title (if (string-match "\\(.*\\) #[0-9]+$" heading)
+                    (match-string 1 heading)
+                  heading))
+         (remote-title (when remote-data (alist-get 'title remote-data)))
+         (deadline-str (org-entry-get (point) "DEADLINE"))
+         (milestone (org-entry-get (point) "MILESTONE"))
+         (assignees-str (org-entry-get (point) "ASSIGNEES"))
+         (local-tags (org-get-tags nil t))
+         (local-closed (or (string= todo-state org-github-closed-state)
+                           (string= todo-state org-github-pr-closed-state)
+                           (string= todo-state org-github-pr-merged-state)))
+         (stored-closed (member (downcase (or local-state "open"))
+                                '("closed" "merged"))))
+
+    ;; --- 1. Push state (close/reopen) ---
+    (cond
+     ((and local-closed (not stored-closed))
+      (org-github--run-gh-sync (list type "close" num "-R" repo))
+      (org-set-property "STATE" "closed")
+      (org-set-property "UPDATED_AT"
+                        (format-time-string "[%Y-%m-%d %a %H:%M]"))
+      (push "state→closed" changes))
+     ((and (not local-closed) stored-closed)
+      (org-github--run-gh-sync (list type "reopen" num "-R" repo))
+      (org-set-property "STATE" "open")
+      (when (org-entry-get (point) "CLOSED_AT")
+        (org-delete-property "CLOSED_AT"))
+      (org-set-property "UPDATED_AT"
+                        (format-time-string "[%Y-%m-%d %a %H:%M]"))
+      (push "state→open" changes)))
+
+    ;; --- 2. Push title (skip if unchanged) ---
+    (when (and title (not (string-empty-p title))
+               (not (and remote-title (string= title remote-title))))
+      (org-github--run-gh-sync
+       (list type "edit" num "-R" repo "--title" title))
+      (push "title" changes))
+
+    ;; --- 3. Build single edit command for assignees + labels + milestone ---
+    (let ((edit-args (list type "edit" num "-R" repo)))
+      ;; Assignees: push all local as --add-assignee (idempotent)
+      (when (and assignees-str (not (string-empty-p assignees-str)))
+        (let ((logins (mapcar #'string-trim (split-string assignees-str ","))))
+          (setq edit-args (append edit-args
+                                  (list "--add-assignee" (string-join logins ","))))
+          (push "assignees" changes)))
+      ;; Labels: use GITHUB_LABELS (raw names from last pull) to avoid sanitization mismatch
+      (let ((github-labels-str (org-entry-get (point) "GITHUB_LABELS")))
+        (when (and github-labels-str (not (string-empty-p github-labels-str)))
+          (setq edit-args (append edit-args
+                                  (list "--add-label" github-labels-str)))
+          (push "labels" changes)))
+      ;; Milestone
+      (if milestone
+          (progn
+            (setq edit-args (append edit-args (list "--milestone" milestone)))
+            (push "milestone" changes))
+        (setq edit-args (append edit-args (list "--remove-milestone"))))
+      ;; Single gh call for all edit fields
+      (org-github--run-gh-sync edit-args))
+
+    ;; --- 4. Push deadline to GitHub Projects V2 ---
+    (when deadline-str
+      (org-github--push-deadline-at-point repo (string-to-number num) deadline-str)
+      (push "deadline" changes))
+
+    changes))
+
 ;;;###autoload
 (defun org-github-sync-at-point ()
-  "Push local org heading state to GitHub for the issue/PR at point.
-Pure push — reads only local properties and posts them to GitHub.
-No fetching, no overwriting local state.
-Similar to `org-gcal-post-at-point'."
+  "Bidirectional sync for the GitHub issue/PR at point.
+Fetches the latest data from GitHub, compares UPDATED_AT timestamps,
+and syncs in the appropriate direction:
+- If GitHub is newer → pull (overwrite local with remote data).
+- If local is newer  → push (post local changes to GitHub).
+- If equal           → report already in sync.
+With prefix arg \\[universal-argument], force pull from GitHub.
+With double prefix \\[universal-argument] \\[universal-argument], force push to GitHub."
   (interactive)
-  (save-excursion
-    (org-back-to-heading t)
-    (let ((issue-num (org-entry-get (point) "ISSUE_NUMBER"))
-          (pr-num (org-entry-get (point) "PR_NUMBER"))
-          (repo (org-entry-get (point) "REPO")))
-      (if (and repo (or issue-num pr-num))
-          (let* ((is-pr (not (null pr-num)))
-                 (num (if is-pr pr-num issue-num))
-                 (type (if is-pr "pr" "issue"))
-                 (org-github--syncing t)
-                 (changes '())
-                 ;; Read all local state upfront
-                 (todo-state (org-get-todo-state))
-                 (local-state (org-entry-get (point) "STATE"))
-                 (heading (org-get-heading t t t t))
-                 (title (if (string-match "\\(.*\\) #[0-9]+$" heading)
-                            (match-string 1 heading)
-                          heading))
-                 (deadline-str (org-entry-get (point) "DEADLINE"))
-                 (milestone (org-entry-get (point) "MILESTONE"))
-                 (assignees-str (org-entry-get (point) "ASSIGNEES"))
-                 (local-tags (org-get-tags nil t))
-                 (local-closed (or (string= todo-state org-github-closed-state)
-                                   (string= todo-state org-github-pr-closed-state)
-                                   (string= todo-state org-github-pr-merged-state)))
-                 (stored-closed (member (downcase (or local-state "open"))
-                                        '("closed" "merged"))))
+  (let ((agenda-marker (when (derived-mode-p 'org-agenda-mode)
+                         (or (org-get-at-bol 'org-hd-marker)
+                             (org-get-at-bol 'org-marker)))))
+    (if agenda-marker
+        (with-current-buffer (marker-buffer agenda-marker)
+          (save-excursion
+            (goto-char (marker-position agenda-marker))
+            (org-github-sync-at-point)))
+      (save-excursion
+        (org-back-to-heading t)
+        (let ((issue-num (org-entry-get (point) "ISSUE_NUMBER"))
+              (pr-num (org-entry-get (point) "PR_NUMBER"))
+              (repo (org-entry-get (point) "REPO")))
+          (if (and repo (or issue-num pr-num))
+              (let* ((is-pr (not (null pr-num)))
+                     (num-str (if is-pr pr-num issue-num))
+                     (num (string-to-number num-str))
+                     (type (if is-pr "pr" "issue"))
+                     (prefix current-prefix-arg))
 
-            (message "Posting %s #%s to %s..." type num repo)
+                (message "Syncing %s #%s from %s..." type num-str repo)
 
-            ;; --- 1. Push state (close/reopen) ---
-            (cond
-             ((and local-closed (not stored-closed))
-              (org-github--run-gh-sync (list type "close" num "-R" repo))
-              (org-set-property "STATE" "closed")
-              (org-set-property "UPDATED_AT"
-                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
-              (push "state→closed" changes))
-             ((and (not local-closed) stored-closed)
-              (org-github--run-gh-sync (list type "reopen" num "-R" repo))
-              (org-set-property "STATE" "open")
-              (when (org-entry-get (point) "CLOSED_AT")
-                (org-delete-property "CLOSED_AT"))
-              (org-set-property "UPDATED_AT"
-                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
-              (push "state→open" changes)))
+                ;; Fetch remote data
+                (let* ((remote-data (if is-pr
+                                        (org-github--fetch-single-pr repo num)
+                                      (org-github--fetch-single-issue repo num)))
+                       (remote-updated (alist-get 'updatedAt remote-data))
+                       (local-updated (org-entry-get (point) "UPDATED_AT"))
+                       (remote-time (org-github--parse-updated-at remote-updated))
+                       (local-time (org-github--parse-updated-at local-updated))
+                       (force-pull (equal prefix '(4)))
+                       (force-push (equal prefix '(16))))
 
-            ;; --- 2. Push title ---
-            (when (and title (not (string-empty-p title)))
-              (org-github--run-gh-sync
-               (list type "edit" num "-R" repo "--title" title))
-              (push "title" changes))
+                  (cond
+                   (force-pull
+                    (org-github--pull-at-point repo num type remote-data)
+                    (message "Pulled %s #%s from %s (forced)" type num-str repo))
 
-            ;; --- 3. Build single edit command for assignees + labels + milestone ---
-            (let ((edit-args (list type "edit" num "-R" repo)))
-              ;; Assignees: push all local as --add-assignee (idempotent)
-              (when (and assignees-str (not (string-empty-p assignees-str)))
-                (let ((logins (mapcar #'string-trim (split-string assignees-str ","))))
-                  (setq edit-args (append edit-args
-                                          (list "--add-assignee" (string-join logins ","))))
-                  (push "assignees" changes)))
-              ;; Labels: push all local tags as --add-label (idempotent)
-              (when local-tags
-                (setq edit-args (append edit-args
-                                        (list "--add-label" (string-join local-tags ","))))
-                (push "labels" changes))
-              ;; Milestone
-              (if milestone
-                  (progn
-                    (setq edit-args (append edit-args (list "--milestone" milestone)))
-                    (push "milestone" changes))
-                (setq edit-args (append edit-args (list "--remove-milestone"))))
-              ;; Single gh call for all edit fields
-              (org-github--run-gh-sync edit-args))
+                   (force-push
+                    (let ((changes (org-github--push-at-point repo num-str type remote-data)))
+                      (message "Pushed %s #%s to %s (forced): %s"
+                               type num-str repo
+                               (if changes
+                                   (string-join (nreverse changes) ", ")
+                                 "no changes"))))
 
-            ;; --- 4. Push deadline to GitHub Projects V2 ---
-            (when deadline-str
-              (org-github--push-deadline-at-point repo (string-to-number num) deadline-str)
-              (push "deadline" changes))
+                   ((time-less-p local-time remote-time)
+                    ;; Remote is newer → pull
+                    (org-github--pull-at-point repo num type remote-data)
+                    (message "Pulled %s #%s from %s (remote was newer)" type num-str repo))
 
-            (message "Posted %s #%s to %s: %s"
-                     type num repo
-                     (if changes
-                         (string-join (nreverse changes) ", ")
-                       "no changes")))
-        (message "Not on a GitHub issue/PR")))))
+                   ((time-less-p remote-time local-time)
+                    ;; Local is newer → push
+                    (let ((changes (org-github--push-at-point repo num-str type remote-data)))
+                      (message "Pushed %s #%s to %s (local was newer): %s"
+                               type num-str repo
+                               (if changes
+                                   (string-join (nreverse changes) ", ")
+                                 "no changes"))))
+
+                   (t
+                    ;; Timestamps equal — still pull to ensure metadata is fresh
+                    (org-github--pull-at-point repo num type remote-data)
+                    (message "%s #%s in %s is in sync" type num-str repo)))))
+
+            (message "Not on a GitHub issue/PR")))))))
+
+;;;###autoload
+(defun org-github-pull-at-point ()
+  "Pull the latest GitHub data for the issue/PR at point.
+Overwrites local org heading with remote state, metadata, and timestamps."
+  (interactive)
+  (let ((current-prefix-arg '(4)))
+    (org-github-sync-at-point)))
+
+;;;###autoload
+(defun org-github-push-at-point ()
+  "Push local org heading state to GitHub for the issue/PR at point.
+Posts local state, title, assignees, labels, milestone, and deadline."
+  (interactive)
+  (let ((current-prefix-arg '(16)))
+    (org-github-sync-at-point)))
 
 (defun org-github--push-deadline-at-point (repo number deadline-str)
   "Push DEADLINE-STR to GitHub Projects V2 for issue NUMBER in REPO.
@@ -889,10 +1086,31 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
 (defun org-github-full-sync (&optional repo)
   "Full sync: download new issues/PRs and update states of existing ones."
   (interactive)
-  (let ((repo (or repo (completing-read "Repository: " org-github-default-repos
-                                         nil nil nil nil (car org-github-default-repos)))))
-    (org-github-sync-issue-states repo)
-    (org-github-sync-pr-states repo)))
+  (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
+                                          nil nil nil nil (car org-github-default-repos))))
+         (frames ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"])
+         (idx 0)
+         (label "")
+         (timer nil))
+    (cl-flet ((spinner-start (msg)
+                (setq label msg idx 0)
+                (when timer (cancel-timer timer))
+                (setq timer
+                      (run-with-timer
+                       0 0.1
+                       (lambda ()
+                         (message "%s %s"
+                                  (aref frames (mod idx (length frames)))
+                                  label)
+                         (setq idx (1+ idx))))))
+              (spinner-stop ()
+                (when timer (cancel-timer timer) (setq timer nil))))
+      (spinner-start (format "Full sync for %s: fetching issues..." repo))
+      (org-github-sync-issue-states repo)
+      (spinner-start (format "Full sync for %s: fetching PRs..." repo))
+      (org-github-sync-pr-states repo)
+      (spinner-stop)
+      (message "✅ Full sync complete for %s" repo))))
 
 ;;;###autoload
 (defun org-github-download-issues (&optional repo)
@@ -938,12 +1156,23 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
 
 ;;;###autoload
 (defun org-github-download-all (&optional repo)
-  "Download issues and PRs from REPO."
+  "Pull everything for REPO into the local org file.
+Does four things in order so a single command leaves the local copy
+fully current:
+  1. Download any new issues that don't exist locally.
+  2. Download any new PRs that don't exist locally.
+  3. Sync state + metadata (assignees, labels, milestone, deadline,
+     updated-at) for every existing issue.
+  4. Same for every existing PR.
+If you only want to add newly-created items without touching existing
+ones, call `org-github-download-issues' / `-download-prs' directly."
   (interactive)
   (let ((repo (or repo (completing-read "Repository: " org-github-default-repos
                                          nil nil nil nil (car org-github-default-repos)))))
     (org-github-download-issues repo)
-    (org-github-download-prs repo)))
+    (org-github-download-prs repo)
+    (org-github-sync-issue-states repo)
+    (org-github-sync-pr-states repo)))
 
 ;;;###autoload
 (defun org-github-sync-repos ()
@@ -989,10 +1218,15 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
         (org-clock-out)
         (when (and org-github-log-to-github repo (or issue-num pr-num))
           (when (y-or-n-p (format "Log %s to GitHub #%s? " time-str (or pr-num issue-num)))
-            (org-github--run-gh-sync
+            (message "Logging time to GitHub...")
+            (org-github--run-gh-async
              (list "issue" "comment" (or issue-num pr-num)
                    "-R" repo
-                   "-b" (format "Time tracked: %s" time-str)))))))))
+                   "-b" (format "Time tracked: %s" time-str))
+             (lambda (_output error)
+               (if error
+                   (message "Failed to log time: %s" error)
+                 (message "Time logged to GitHub #%s" (or pr-num issue-num)))))))))))
 
 ;;; Browser/View Commands
 
@@ -1018,15 +1252,19 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
           (repo (org-entry-get (point) "REPO")))
       (if (and repo (or issue-num pr-num))
           (let* ((type (if pr-num "pr" "issue"))
-                 (num (or pr-num issue-num))
-                 (output (org-github--run-gh-sync
-                          (list type "view" num "-R" repo))))
-            (with-current-buffer (get-buffer-create "*GitHub View*")
-              (erase-buffer)
-              (insert output)
-              (goto-char (point-min))
-              (view-mode 1))
-            (pop-to-buffer "*GitHub View*"))
+                 (num (or pr-num issue-num)))
+            (message "Loading...")
+            (org-github--run-gh-async
+             (list type "view" num "-R" repo)
+             (lambda (output error)
+               (if error
+                   (message "Failed to fetch %s #%s: %s" type num error)
+                 (with-current-buffer (get-buffer-create "*GitHub View*")
+                   (erase-buffer)
+                   (insert output)
+                   (goto-char (point-min))
+                   (view-mode 1))
+                 (pop-to-buffer "*GitHub View*")))))
         (message "Not on a GitHub issue/PR")))))
 
 ;;; Issue Management Commands
@@ -1044,14 +1282,23 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
           (let* ((type (if pr-num "pr" "issue"))
                  (num (or pr-num issue-num)))
             (when (y-or-n-p (format "Close %s #%s? " type num))
-              (org-github--run-gh-sync (list type "close" num "-R" repo))
-              (org-todo org-github-closed-state)
-              (org-set-property "STATE" "closed")
-              (org-set-property "CLOSED_AT"
-                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
-              (org-set-property "UPDATED_AT"
-                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
-              (message "Closed %s #%s" type num)))
+              (let ((marker (point-marker)))
+                (org-github--run-gh-async
+                 (list type "close" num "-R" repo)
+                 (lambda (_output error)
+                   (if error
+                       (message "Failed to close %s #%s: %s" type num error)
+                     (when (buffer-live-p (marker-buffer marker))
+                       (with-current-buffer (marker-buffer marker)
+                         (goto-char (marker-position marker))
+                         (let ((org-github--syncing t))
+                           (org-todo org-github-closed-state)
+                           (org-set-property "STATE" "closed")
+                           (org-set-property "CLOSED_AT"
+                                             (format-time-string "[%Y-%m-%d %a %H:%M]"))
+                           (org-set-property "UPDATED_AT"
+                                             (format-time-string "[%Y-%m-%d %a %H:%M]"))))
+                       (message "Closed %s #%s" type num))))))))
         (message "Not on a GitHub issue/PR")))))
 
 ;;;###autoload
@@ -1067,9 +1314,12 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
           (let* ((num (or pr-num issue-num))
                  (comment (read-string "Comment: ")))
             (when (not (string-empty-p comment))
-              (org-github--run-gh-sync
-               (list "issue" "comment" num "-R" repo "-b" comment))
-              (message "Comment added to #%s" num)))
+              (org-github--run-gh-async
+               (list "issue" "comment" num "-R" repo "-b" comment)
+               (lambda (_output error)
+                 (if error
+                     (message "Failed to add comment to #%s: %s" num error)
+                   (message "Comment added to #%s" num))))))
         (message "Not on a GitHub issue/PR")))))
 
 ;;;###autoload
@@ -1083,15 +1333,22 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
            (repo (completing-read "Repository: " org-github-default-repos
                             nil nil nil nil (car org-github-default-repos))))
       (when (y-or-n-p (format "Create issue '%s' in %s? " title repo))
-        (let ((output (org-github--run-gh-sync
-                       (list "issue" "create" "-R" repo "-t" title "-b" (or body "")))))
-          (when (string-match "https://github.com/[^[:space:]]+" output)
-            (let ((url (match-string 0 output)))
-              (org-set-property "URL" url)
-              (when (string-match "/issues/\\([0-9]+\\)" url)
-                (org-set-property "ISSUE_NUMBER" (match-string 1 url)))
-              (org-set-property "REPO" repo)
-              (message "Created: %s" url))))))))
+        (let ((marker (point-marker)))
+          (org-github--run-gh-async
+           (list "issue" "create" "-R" repo "-t" title "-b" (or body ""))
+           (lambda (output error)
+             (if error
+                 (message "Failed to create issue: %s" error)
+               (when (string-match "https://github.com/[^[:space:]]+" output)
+                 (let ((url (match-string 0 output)))
+                   (when (buffer-live-p (marker-buffer marker))
+                     (with-current-buffer (marker-buffer marker)
+                       (goto-char (marker-position marker))
+                       (org-set-property "URL" url)
+                       (when (string-match "/issues/\\([0-9]+\\)" url)
+                         (org-set-property "ISSUE_NUMBER" (match-string 1 url)))
+                       (org-set-property "REPO" repo)))
+                   (message "Created: %s" url)))))))))))
 
 ;;; Git Analysis Commands
 
@@ -1173,39 +1430,52 @@ Suppressed during sync operations."
       (cond
        ;; Marked as DONE → close on GitHub
        ((string= new-state org-github-closed-state)
-        (let ((comment (read-string
-                        (format "Closing note for #%s (empty to skip): " issue-num))))
-          (unless (string-empty-p comment)
-            (condition-case err
-                (org-github--run-gh-sync
-                 (list "issue" "comment" issue-num "-R" repo "-b" comment))
-              (error (message "Failed to add comment: %s" (error-message-string err)))))
+        (let* ((comment (read-string
+                         (format "Closing note for #%s (empty to skip): " issue-num)))
+               (marker (point-marker))
+               (calls (append
+                       (unless (string-empty-p comment)
+                         (list (list "issue" "comment" issue-num "-R" repo "-b" comment)))
+                       (list (list "issue" "close" issue-num "-R" repo)))))
           (condition-case err
-              (progn
-                (org-github--run-gh-sync
-                 (list "issue" "close" issue-num "-R" repo))
-                (org-set-property "STATE" "CLOSED")
-                (org-set-property "CLOSED_AT"
-                                  (format-time-string "[%Y-%m-%d %a %H:%M]"))
-                (org-set-property "UPDATED_AT"
-                                  (format-time-string "[%Y-%m-%d %a %H:%M]"))
-                (message "Closed #%s on GitHub%s" issue-num
-                         (if (string-empty-p comment) "" " (with comment)")))
+              (org-github--run-calls-async
+               calls
+               (lambda (error)
+                 (if error
+                     (message "Failed to close issue #%s: %s" issue-num error)
+                   (when (buffer-live-p (marker-buffer marker))
+                     (with-current-buffer (marker-buffer marker)
+                       (goto-char (marker-position marker))
+                       (let ((org-github--syncing t))
+                         (org-set-property "STATE" "CLOSED")
+                         (org-set-property "CLOSED_AT"
+                                           (format-time-string "[%Y-%m-%d %a %H:%M]"))
+                         (org-set-property "UPDATED_AT"
+                                           (format-time-string "[%Y-%m-%d %a %H:%M]")))))
+                   (message "Closed #%s on GitHub%s" issue-num
+                            (if (string-empty-p comment) "" " (with comment)")))))
             (error (message "Failed to close issue: %s" (error-message-string err))))))
        ;; Reopened (back to TODO/NEXT from DONE) → reopen on GitHub
        ((and (member new-state (cons org-github-issue-todo-state
                                       org-github-open-substates))
              (string= (downcase (or (org-entry-get (point) "STATE") "")) "closed"))
-        (condition-case err
-            (progn
-              (org-github--run-gh-sync
-               (list "issue" "reopen" issue-num "-R" repo))
-              (org-set-property "STATE" "OPEN")
-              (org-delete-property "CLOSED_AT")
-              (org-set-property "UPDATED_AT"
-                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
-              (message "Reopened #%s on GitHub" issue-num))
-          (error (message "Failed to reopen issue: %s" (error-message-string err)))))))))
+        (let ((marker (point-marker)))
+          (condition-case err
+              (org-github--run-gh-async
+               (list "issue" "reopen" issue-num "-R" repo)
+               (lambda (_output error)
+                 (if error
+                     (message "Failed to reopen issue #%s: %s" issue-num error)
+                   (when (buffer-live-p (marker-buffer marker))
+                     (with-current-buffer (marker-buffer marker)
+                       (goto-char (marker-position marker))
+                       (let ((org-github--syncing t))
+                         (org-set-property "STATE" "OPEN")
+                         (org-delete-property "CLOSED_AT")
+                         (org-set-property "UPDATED_AT"
+                                           (format-time-string "[%Y-%m-%d %a %H:%M]")))))
+                   (message "Reopened #%s on GitHub" issue-num))))
+            (error (message "Failed to reopen issue: %s" (error-message-string err))))))))))
 
 ;;;###autoload
 (define-minor-mode org-github-mode
@@ -1217,6 +1487,366 @@ will update the issue/PR on GitHub accordingly."
   (if org-github-mode
       (add-hook 'org-after-todo-state-change-hook #'org-github--on-todo-state-change)
     (remove-hook 'org-after-todo-state-change-hook #'org-github--on-todo-state-change)))
+
+;;;###autoload
+(defun org-github-diagnose-at-point ()
+  "Compare the item at point with the live GitHub record.
+Fetches the current issue/PR from GitHub and prints a side-by-side
+report of each field (state, assignees, labels, milestone, deadline,
+updated-at) so you can see where local and remote diverged.  Useful
+when the dashboard shows an item in a \"No X\" block but GitHub says
+otherwise."
+  (interactive)
+  (let* ((repo (org-entry-get (point) "REPO"))
+         (iss (org-entry-get (point) "ISSUE_NUMBER"))
+         (pr (org-entry-get (point) "PR_NUMBER"))
+         (num-str (or iss pr)))
+    (unless (and repo num-str)
+      (user-error "Not on a GitHub item heading"))
+    (let* ((num (string-to-number num-str))
+           (is-pr (not (null pr)))
+           (remote (if is-pr
+                       (org-github--fetch-single-pr repo num)
+                     (org-github--fetch-single-issue repo num)))
+           (local-state (org-entry-get (point) "STATE"))
+           (local-assignees (org-entry-get (point) "ASSIGNEES"))
+           (local-milestone (org-entry-get (point) "MILESTONE"))
+           (local-deadline (org-entry-get (point) "DEADLINE"))
+           (local-updated (org-entry-get (point) "UPDATED_AT"))
+           (local-tags (org-get-tags nil t))
+           (remote-state (alist-get 'state remote))
+           (remote-assignees (mapconcat (lambda (a) (alist-get 'login a))
+                                        (alist-get 'assignees remote) ", "))
+           (remote-milestone (alist-get 'title (alist-get 'milestone remote)))
+           (remote-labels (mapcar (lambda (l) (alist-get 'name l))
+                                  (alist-get 'labels remote)))
+           (remote-updated (alist-get 'updatedAt remote))
+           (fmt (lambda (label l r)
+                  (let ((match (equal (or l "") (or r ""))))
+                    (format "  %-14s %s\n  %-14s %s\n  %-14s %s\n\n"
+                            (concat label ":")
+                            (if match "(match)" "(DIFFERS)")
+                            "  local" (or l "(unset)")
+                            "  remote" (or r "(unset)"))))))
+      (with-current-buffer (get-buffer-create "*org-github-diagnose*")
+        (erase-buffer)
+        (insert (format "=== %s %s#%d ===\n\n" repo (if is-pr "PR" "issue") num))
+        (if (null remote)
+            (insert "ERROR: could not fetch from GitHub (check gh CLI auth & network)\n")
+          (insert (funcall fmt "state" local-state remote-state))
+          (insert (funcall fmt "assignees" local-assignees
+                           (if (string-empty-p remote-assignees) nil remote-assignees)))
+          (insert (funcall fmt "milestone" local-milestone remote-milestone))
+          (insert (funcall fmt "deadline" local-deadline nil))
+          (insert (funcall fmt "updated_at" local-updated remote-updated))
+          (insert (format "  local tags:  %s\n" (or local-tags "(none)")))
+          (insert (format "  remote lbls: %s\n" (or remote-labels "(none)")))
+          (insert "\nIf any row says DIFFERS, the local copy is stale.  Run\n")
+          (insert "`M-x org-github-sync-issue-states' (or -pr-states) to refresh,\n")
+          (insert "or `M-x org-github-pull-at-point' to pull this one item now.\n"))
+        (goto-char (point-min)))
+      (display-buffer "*org-github-diagnose*"))))
+
+;;; Async Sync
+
+(defun org-github--run-gh-async (args callback)
+  "Run gh CLI with ARGS asynchronously.
+CALLBACK receives (OUTPUT ERROR-STRING) — one will be nil on completion."
+  (if (not (org-github--gh-available-p))
+      (funcall callback nil "GitHub CLI (gh) not found. Install from https://cli.github.com/")
+    (let ((buf (generate-new-buffer " *org-github-async*")))
+      (make-process
+       :name "org-github-gh"
+       :buffer buf
+       :command (cons "gh" args)
+       :noquery t
+       :sentinel
+       (lambda (proc _event)
+         (when (memq (process-status proc) '(exit signal))
+           (let* ((exit-code (process-exit-status proc))
+                  (output (with-current-buffer (process-buffer proc)
+                            (buffer-string))))
+             (when (buffer-live-p (process-buffer proc))
+               (kill-buffer (process-buffer proc)))
+             (if (zerop exit-code)
+                 (funcall callback output nil)
+               (funcall callback nil output)))))))))
+
+(defun org-github--run-calls-async (calls done-cb)
+  "Execute CALLS (list of gh arg lists) sequentially and asynchronously.
+DONE-CB is called with nil on success or an error string on the first failure."
+  (if (null calls)
+      (funcall done-cb nil)
+    (org-github--run-gh-async
+     (car calls)
+     (lambda (_output error)
+       (if error
+           (funcall done-cb error)
+         (org-github--run-calls-async (cdr calls) done-cb))))))
+
+(defun org-github--push-deadline-async (repo number deadline-str callback)
+  "Push DEADLINE-STR to GitHub Projects V2 for issue NUMBER in REPO asynchronously.
+CALLBACK receives nil on success or an error string."
+  (let ((project-config (cdr (assoc repo org-github-repo-project-alist))))
+    (if (not project-config)
+        (funcall callback nil)
+      (let* ((owner (car project-config))
+             (project-num (cdr project-config))
+             (query (format "{
+  user(login: \"%s\") {
+    projectV2(number: %d) {
+      id
+      field(name: \"Deadline\") {
+        ... on ProjectV2SingleSelectField { id }
+        ... on ProjectV2Field { id }
+      }
+      items(first: 100) {
+        nodes {
+          id
+          content {
+            ... on Issue { number repository { nameWithOwner } }
+          }
+        }
+      }
+    }
+  }
+}" owner project-num)))
+        (org-github--run-gh-async
+         (list "api" "graphql" "-f" (concat "query=" query))
+         (lambda (output error)
+           (if error
+               (funcall callback error)
+             (let* ((data (org-github--parse-json output))
+                    (project-data (alist-get 'projectV2
+                                             (alist-get 'user
+                                                        (alist-get 'data data))))
+                    (project-id (alist-get 'id project-data))
+                    (field-id (alist-get 'id (alist-get 'field project-data)))
+                    (items (alist-get 'nodes (alist-get 'items project-data)))
+                    (item-id (cl-loop for item in items
+                                      when (let ((content (alist-get 'content item)))
+                                             (and (= (alist-get 'number content) number)
+                                                  (string= (alist-get 'nameWithOwner
+                                                                       (alist-get 'repository content))
+                                                           repo)))
+                                      return (alist-get 'id item))))
+               (if (not (and project-id field-id item-id))
+                   (funcall callback nil)
+                 (let ((date (format-time-string "%Y-%m-%d"
+                                                 (org-time-string-to-time deadline-str))))
+                   (org-github--run-gh-async
+                    (list "project" "item-edit"
+                          "--id" item-id
+                          "--project-id" project-id
+                          "--field-id" field-id
+                          "--date" date)
+                    (lambda (_out err) (funcall callback err)))))))))))))
+
+(defun org-github--collect-push-ops (repo num-str type remote-data)
+  "Collect push operations for the GitHub item heading at point.
+Returns a plist:
+  :calls   — list of gh arg lists to run sequentially
+  :post-fn — function taking a DONE-CB; applies org property updates then
+             optionally pushes deadline to GitHub asynchronously
+  :changes — list of change description strings"
+  (let* ((todo-state (org-get-todo-state))
+         (local-state (org-entry-get (point) "STATE"))
+         (heading (org-get-heading t t t t))
+         (title (if (string-match "\\(.*\\) #[0-9]+$" heading)
+                    (match-string 1 heading)
+                  heading))
+         (remote-title (when remote-data (alist-get 'title remote-data)))
+         (deadline-str (org-entry-get (point) "DEADLINE"))
+         (milestone (org-entry-get (point) "MILESTONE"))
+         (assignees-str (org-entry-get (point) "ASSIGNEES"))
+         (github-labels-str (org-entry-get (point) "GITHUB_LABELS"))
+         (local-closed (or (string= todo-state org-github-closed-state)
+                           (string= todo-state org-github-pr-closed-state)
+                           (string= todo-state org-github-pr-merged-state)))
+         (stored-closed (member (downcase (or local-state "open"))
+                                '("closed" "merged")))
+         (calls '())
+         (changes '())
+         (post-props '())
+         (post-deadline-args nil)
+         (pos-marker (point-marker)))
+
+    ;; --- State change ---
+    (cond
+     ((and local-closed (not stored-closed))
+      (push (list type "close" num-str "-R" repo) calls)
+      (push "state→closed" changes)
+      (push (cons "STATE" "closed") post-props)
+      (push (cons "UPDATED_AT" (format-time-string "[%Y-%m-%d %a %H:%M]")) post-props))
+     ((and (not local-closed) stored-closed)
+      (push (list type "reopen" num-str "-R" repo) calls)
+      (push "state→open" changes)
+      (push (cons "STATE" "open") post-props)
+      (push (cons "UPDATED_AT" (format-time-string "[%Y-%m-%d %a %H:%M]")) post-props)
+      (when (org-entry-get (point) "CLOSED_AT")
+        (push (cons "CLOSED_AT" :delete) post-props))))
+
+    ;; --- Metadata: title + assignees + labels + milestone (one combined call) ---
+    (let ((edit-args (list type "edit" num-str "-R" repo)))
+      (when (and title (not (string-empty-p title))
+                 (not (and remote-title (string= title remote-title))))
+        (setq edit-args (append edit-args (list "--title" title)))
+        (push "title" changes))
+      (when (and assignees-str (not (string-empty-p assignees-str)))
+        (setq edit-args (append edit-args
+                                (list "--add-assignee"
+                                      (string-join (mapcar #'string-trim
+                                                           (split-string assignees-str ","))
+                                                   ","))))
+        (push "assignees" changes))
+      (when (and github-labels-str (not (string-empty-p github-labels-str)))
+        (setq edit-args (append edit-args (list "--add-label" github-labels-str)))
+        (push "labels" changes))
+      (if milestone
+          (progn
+            (setq edit-args (append edit-args (list "--milestone" milestone)))
+            (push "milestone" changes))
+        (setq edit-args (append edit-args (list "--remove-milestone"))))
+      (push edit-args calls))
+
+    ;; --- Deadline ---
+    (when (and deadline-str (assoc repo org-github-repo-project-alist))
+      (setq post-deadline-args (list repo (string-to-number num-str) deadline-str))
+      (push "deadline" changes))
+
+    (list :calls (nreverse calls)
+          :post-fn
+          (let ((props (nreverse post-props))
+                (dl-args post-deadline-args))
+            (lambda (done-cb)
+              (when (and (markerp pos-marker)
+                         (buffer-live-p (marker-buffer pos-marker)))
+                (with-current-buffer (marker-buffer pos-marker)
+                  (save-excursion
+                    (goto-char (marker-position pos-marker))
+                    (org-back-to-heading t)
+                    (let ((org-github--syncing t))
+                      (dolist (pair props)
+                        (if (eq (cdr pair) :delete)
+                            (org-delete-property (car pair))
+                          (org-set-property (car pair) (cdr pair))))))))
+              (if dl-args
+                  (apply #'org-github--push-deadline-async
+                         (append dl-args
+                                 (list (lambda (err)
+                                         (when err
+                                           (message "org-github: deadline push failed: %s" err))
+                                         (funcall done-cb nil)))))
+                (funcall done-cb nil))))
+          :changes (nreverse changes))))
+
+;;;###autoload
+(defun org-github-sync-at-point-async (&optional prefix done-callback)
+  "Asynchronous bidirectional sync for the GitHub issue/PR at point.
+PREFIX: \\[universal-argument] force-pull, \\[universal-argument] \\[universal-argument] force-push.
+DONE-CALLBACK is called with nil on success or an error string on failure."
+  (org-back-to-heading t)
+  (let ((issue-num (org-entry-get (point) "ISSUE_NUMBER"))
+        (pr-num (org-entry-get (point) "PR_NUMBER"))
+        (repo (org-entry-get (point) "REPO")))
+    (if (not (and repo (or issue-num pr-num)))
+        (progn
+          (message "Not on a GitHub issue/PR")
+          (when done-callback (funcall done-callback nil)))
+      (let* ((is-pr (not (null pr-num)))
+             (num-str (if is-pr pr-num issue-num))
+             (num (string-to-number num-str))
+             (type (if is-pr "pr" "issue"))
+             (force-pull (equal prefix '(4)))
+             (force-push (equal prefix '(16)))
+             (sync-key (cons repo num-str))
+             (org-marker (point-marker))
+             (fetch-args
+              (if is-pr
+                  (list "pr" "view" num-str "-R" repo
+                        "--json" "number,title,body,state,createdAt,updatedAt,closedAt,mergedAt,labels,assignees,milestone,url,author,headRefName,baseRefName")
+                (list "issue" "view" num-str "-R" repo
+                      "--json" "number,title,body,state,createdAt,updatedAt,closedAt,labels,assignees,milestone,url,author"))))
+        (if (gethash sync-key org-github--active-syncs)
+            (progn
+              (message "org-github: %s #%s is already syncing" type num-str)
+              (when done-callback (funcall done-callback nil)))
+          (puthash sync-key t org-github--active-syncs)
+          (message "Syncing %s #%s from %s..." type num-str repo)
+          (org-github--run-gh-async
+           fetch-args
+           (lambda (output error)
+             (remhash sync-key org-github--active-syncs)
+             (if error
+                 (progn
+                   (message "org-github: failed to fetch %s #%s: %s" type num-str error)
+                   (when done-callback (funcall done-callback error)))
+               (let* ((remote-data (org-github--parse-json output))
+                      (remote-updated (alist-get 'updatedAt remote-data))
+                      (local-updated
+                       (when (and (markerp org-marker)
+                                  (buffer-live-p (marker-buffer org-marker)))
+                         (with-current-buffer (marker-buffer org-marker)
+                           (save-excursion
+                             (goto-char (marker-position org-marker))
+                             (org-entry-get (point) "UPDATED_AT")))))
+                      (remote-time (org-github--parse-updated-at remote-updated))
+                      (local-time (org-github--parse-updated-at local-updated)))
+                 (cond
+                  ;; Pull: remote newer, force-pull, or timestamps equal
+                  ((or force-pull
+                       (time-less-p local-time remote-time)
+                       (and (not force-push)
+                            (not (time-less-p local-time remote-time))
+                            (not (time-less-p remote-time local-time))))
+                   (when (and (markerp org-marker)
+                              (buffer-live-p (marker-buffer org-marker)))
+                     (with-current-buffer (marker-buffer org-marker)
+                       (save-excursion
+                         (goto-char (marker-position org-marker))
+                         (org-back-to-heading t)
+                         (org-github--pull-at-point repo num type remote-data))))
+                   (message (cond
+                             (force-pull "Pulled %s #%s from %s (forced)")
+                             ((time-less-p local-time remote-time)
+                              "Pulled %s #%s from %s (remote was newer)")
+                             (t "%s #%s in %s is in sync"))
+                            type num-str repo)
+                   (when done-callback (funcall done-callback nil)))
+
+                  ;; Push: local newer or force-push
+                  (t
+                   (let ((ops
+                          (when (and (markerp org-marker)
+                                     (buffer-live-p (marker-buffer org-marker)))
+                            (with-current-buffer (marker-buffer org-marker)
+                              (save-excursion
+                                (goto-char (marker-position org-marker))
+                                (org-back-to-heading t)
+                                (org-github--collect-push-ops
+                                 repo num-str type remote-data))))))
+                     (if (null ops)
+                         (when done-callback (funcall done-callback nil))
+                       (let ((calls (plist-get ops :calls))
+                             (post-fn (plist-get ops :post-fn))
+                             (changes (plist-get ops :changes)))
+                         (org-github--run-calls-async
+                          calls
+                          (lambda (push-error)
+                            (if push-error
+                                (progn
+                                  (message "org-github: push failed for %s #%s: %s"
+                                           type num-str push-error)
+                                  (when done-callback (funcall done-callback push-error)))
+                              (funcall post-fn
+                                       (lambda (_)
+                                         (message "Pushed %s #%s to %s: %s"
+                                                  type num-str repo
+                                                  (if changes
+                                                      (string-join (nreverse changes) ", ")
+                                                    "no changes"))
+                                         (when done-callback
+                                           (funcall done-callback nil)))))))))))))))))))))
 
 (provide 'org-github)
 
