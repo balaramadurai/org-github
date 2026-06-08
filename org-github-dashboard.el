@@ -27,7 +27,7 @@
 ;; org-github-dashboard provides a team dashboard for GitHub issues and PRs
 ;; tracked by org-github.  It uses org-ql and org-super-agenda to display a
 ;; linear drill-down of attention items, per-assignee workloads and milestone
-;; progress, with filterable views by repo/assignee/status/period and inline
+;; progress, with filterable views by repo/assignee/milestone/status/period and inline
 ;; sync of individual items.
 ;;
 ;; Sections are configurable via `org-github-dashboard-sections':
@@ -38,7 +38,7 @@
 ;;
 ;; Usage:
 ;;   M-x org-github-dashboard       — open the dashboard
-;;   /                               — filter by repos, assignees, status, period
+;;   /                               — filter by repos, assignees, milestones, status, period
 ;;   V d / V w / V m / V a           — view: today / this week / this month / all
 ;;   TAB                             — fold / unfold the block at point
 ;;   <backtab> (S-TAB)               — cycle: fold all / unfold all
@@ -81,6 +81,12 @@ When nil, all repos are shown (no filtering)."
 (defcustom org-github-dashboard-assignees nil
   "List of assignees to include in the GitHub team dashboard.
 When nil, all assignees are shown (no filtering)."
+  :type '(repeat string)
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-milestones nil
+  "List of milestone names to include in the GitHub team dashboard.
+When nil, all milestones are shown (no filtering)."
   :type '(repeat string)
   :group 'org-github-dashboard)
 
@@ -201,6 +207,18 @@ Each entry is (REPO . URL).  When set, `org-github-dashboard-send-discord'
 sends a separate message per repo to its designated webhook.
 Repos not in this alist fall back to `org-github-dashboard-discord-webhook-url'."
   :type '(alist :key-type string :value-type string)
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-email-motivations
+  '("You've got this. One task at a time."
+    "Small steps every day add up to big wins."
+    "Progress, not perfection. Keep shipping."
+    "Today is a great day to close a few issues."
+    "Focus on what matters most — you'll get there.")
+  "Fallback motivational lines for the email banner.
+One is picked at random when no context-specific message applies.
+See `org-github-dashboard--email-motivation'."
+  :type '(repeat string)
   :group 'org-github-dashboard)
 
 (defcustom org-github-dashboard-gantt-default-duration 7
@@ -349,8 +367,9 @@ TS is like \"[2026-02-15 Sun 14:30]\".  Return nil if invalid."
 (defun org-github-dashboard--filtered-issue-query (&rest extra)
   "Build a (github-item) query respecting all active filters.
 EXTRA predicates are ANDed in.  Nil elements in EXTRA are ignored.
-Applies: repo filter, excluded assignees, and positive assignee filter
-\(`org-github-dashboard-assignees' — show only items assigned to these people)."
+Applies: repo filter, excluded assignees, positive assignee filter
+\(`org-github-dashboard-assignees') and positive milestone filter
+\(`org-github-dashboard-milestones')."
   (let ((repo-pred (org-github-dashboard--repo-query))
         (parts (list '(github-item) '(not (todo "CANCELLED"))))
         (excluded org-github-dashboard-excluded-assignees))
@@ -360,6 +379,11 @@ Applies: repo filter, excluded assignees, and positive assignee filter
     (when org-github-dashboard-assignees
       (let ((preds (mapcar (lambda (a) `(github-assignee ,a))
                            org-github-dashboard-assignees)))
+        (push (if (= 1 (length preds)) (car preds) `(or ,@preds))
+              parts)))
+    (when org-github-dashboard-milestones
+      (let ((preds (mapcar (lambda (m) `(property "MILESTONE" ,m))
+                           org-github-dashboard-milestones)))
         (push (if (= 1 (length preds)) (car preds) `(or ,@preds))
               parts)))
     (dolist (e extra) (when e (push e parts)))
@@ -701,6 +725,11 @@ append a block for items with no milestone."
          (milestones (seq-remove
                       (lambda (m) (member m org-github-dashboard-excluded-milestones))
                       all))
+         (milestones (if org-github-dashboard-milestones
+                         (seq-filter (lambda (m)
+                                       (member m org-github-dashboard-milestones))
+                                     milestones)
+                       milestones))
          (blocks nil))
     (dolist (m milestones)
       (let* ((open-query (org-github-dashboard--filtered-issue-query
@@ -827,6 +856,9 @@ is non-nil, also renders compact per-assignee bars."
       (let ((filters nil))
         (when org-github-dashboard-repos
           (push (format "repos: %s" (string-join org-github-dashboard-repos ", "))
+                filters))
+        (when org-github-dashboard-milestones
+          (push (format "milestones: %s" (string-join org-github-dashboard-milestones ", "))
                 filters))
         (when org-github-dashboard-assignees
           (push (format "assignees: %s" (string-join org-github-dashboard-assignees ", "))
@@ -1074,6 +1106,7 @@ If point is not on a block header line, fall back to
     (org-github-dashboard--fixup-done-dates)
     (org-github-dashboard--restyle-section-titles)
     (local-set-key (kbd "/") #'org-github-dashboard-toggle-filter)
+    (local-set-key (kbd "k") #'org-github-dashboard-kanban)
     (local-set-key (kbd "S") #'org-github-dashboard-sync-item)
     (local-set-key (kbd "s-z H P") #'org-github-dashboard-sync-item)
     (local-set-key (kbd "C-d") #'org-github-dashboard-set-deadline)
@@ -1096,10 +1129,10 @@ If point is not on a block header line, fall back to
 
 ;;;###autoload
 (defun org-github-dashboard-toggle-filter ()
-  "Interactively filter the GitHub dashboard by repos, assignees, or status."
+  "Interactively filter the GitHub dashboard by repos, assignees, milestones, status, or period."
   (interactive)
   (let ((dimension (completing-read "Filter by: "
-                                    '("repos" "assignees" "status" "period" "clear all")
+                                    '("repos" "assignees" "milestones" "status" "period" "clear all")
                                     nil t)))
     (pcase dimension
       ("repos"
@@ -1121,6 +1154,17 @@ If point is not on a block header line, fall back to
                          (when org-github-dashboard-assignees
                            (string-join org-github-dashboard-assignees ",")))))
          (setq org-github-dashboard-assignees
+               (if (or (null selected) (equal selected '(""))) nil selected))))
+      ("milestones"
+       (let* ((all-milestones (seq-remove
+                               (lambda (m) (member m org-github-dashboard-excluded-milestones))
+                               (org-github-dashboard--collect-milestones)))
+              (selected (completing-read-multiple
+                         "Include milestones (comma-separated, empty=all): "
+                         all-milestones nil nil
+                         (when org-github-dashboard-milestones
+                           (string-join org-github-dashboard-milestones ",")))))
+         (setq org-github-dashboard-milestones
                (if (or (null selected) (equal selected '(""))) nil selected))))
       ("status"
        (let ((choice (completing-read "Show: " '("all" "open only" "done only") nil t)))
@@ -1150,10 +1194,13 @@ If point is not on a block header line, fall back to
       ("clear all"
        (setq org-github-dashboard-repos nil
              org-github-dashboard-assignees nil
+             org-github-dashboard-milestones nil
              org-github-dashboard-status 'all
              org-github-dashboard-period nil)))
-    (when (derived-mode-p 'org-agenda-mode)
-      (org-github-dashboard))))
+    (cond ((derived-mode-p 'org-agenda-mode)
+           (org-github-dashboard))
+          ((derived-mode-p 'org-github-dashboard-kanban-mode)
+           (org-github-dashboard-kanban-refresh)))))
 
 ;;;###autoload
 (defun org-github-dashboard-sync-item ()
@@ -1598,6 +1645,279 @@ Shows a preview buffer for confirmation before sending."
           (delete-window win))
         (kill-buffer "*Discord Preview*")))))
 
+;;; Email Integration
+
+(defun org-github-dashboard--html-escape (s)
+  "Escape HTML-special characters in string S."
+  (if (null s)
+      ""
+    (replace-regexp-in-string
+     "[&<>]"
+     (lambda (m) (cond ((string= m "&") "&amp;")
+                       ((string= m "<") "&lt;")
+                       (t "&gt;")))
+     s t t)))
+
+(defun org-github-dashboard--email-motivation (total-due total-overdue total-completed)
+  "Return a context-aware motivational line.
+Celebrates when nothing is due or overdue, acknowledges completed
+work, rallies when the overdue or due load is heavy, and otherwise
+falls back to a random line from
+`org-github-dashboard-email-motivations'."
+  (cond
+   ((and (zerop total-due) (> total-completed 0))
+    (format "Nothing due and %d already wrapped up — beautiful work. 🎉"
+            total-completed))
+   ((zerop total-due)
+    "A clear board today. Enjoy the calm — you earned it. 🌤️")
+   ((and (> total-overdue 0) (>= total-overdue (/ total-due 2)))
+    (format "%d overdue, but every one you close is momentum back in your favor. Let's go. 💪"
+            total-overdue))
+   ((> total-overdue 0)
+    "A few are running late — knock those out first and the rest will feel easy. 🚀")
+   ((> total-due 8)
+    "A full plate today. Pick the top three and let the rest follow. 🎯")
+   (t
+    (let ((lines org-github-dashboard-email-motivations))
+      (if lines
+          (nth (random (length lines)) lines)
+        "Keep going — you're doing great.")))))
+
+(defun org-github-dashboard--email-item-html (item &optional overdue done)
+  "Return an HTML <li> string for ITEM.
+When OVERDUE is non-nil, style it as overdue.  When DONE is non-nil,
+style it as completed (strikethrough)."
+  (let* ((title (org-github-dashboard--html-escape (plist-get item :title)))
+         (type (if (eq (plist-get item :type) 'pr) "PR" "Issue"))
+         (num (plist-get item :number))
+         (meta (cond
+                (done (format " <span style=\"color:#888;\">(closed %s)</span>"
+                              (plist-get item :closed-date)))
+                (overdue (format " <span style=\"color:#c0392b;\">(was due %s)</span>"
+                                 (plist-get item :deadline)))
+                ((plist-get item :deadline)
+                 (format " <span style=\"color:#888;\">(due %s)</span>"
+                         (plist-get item :deadline)))
+                (t "")))
+         (label (format "%s #%d" type num)))
+    (cond
+     (done
+      (format "<li style=\"margin:2px 0;color:#888;\"><s>%s</s> <span style=\"color:#aaa;\">%s</span>%s</li>"
+              title label meta))
+     (overdue
+      (format "<li style=\"margin:2px 0;\"><span style=\"color:#c0392b;\">🔴</span> <strong>%s</strong> <span style=\"color:#888;\">%s</span>%s</li>"
+              title label meta))
+     (t
+      (format "<li style=\"margin:2px 0;\">%s <span style=\"color:#888;\">%s</span>%s</li>"
+              title label meta)))))
+
+(defun org-github-dashboard--format-email-html (repos &optional target-date since-date)
+  "Build an HTML summary for REPOS, mirroring the Discord summary.
+With TARGET-DATE (a \"YYYY-MM-DD\" string), include open items due on
+or before that date grouped by assignee with overdue items flagged.
+With SINCE-DATE, append a completed-since section.  With both nil,
+produce the all-open-items weekly summary.  A context-aware
+motivational banner is prepended.  Returns a cons (SUBJECT . HTML)."
+  (let* ((body "") (subject "") (banner-stats (list 0 0 0)))
+    (if (null target-date)
+        ;; All-open weekly summary
+        (let* ((org-github-dashboard-repos repos)
+               (all-assignees (seq-remove
+                               (lambda (a) (member a org-github-dashboard-excluded-assignees))
+                               (org-github-dashboard--collect-assignees)))
+               (assignees (if org-github-dashboard-assignees
+                              (seq-filter (lambda (a) (member a org-github-dashboard-assignees))
+                                          all-assignees)
+                            all-assignees))
+               (mon (format-time-string "%b %d"))
+               (sun (format-time-string "%b %d" (time-add (current-time) (days-to-time 6))))
+               (rows "") (total-oi 0) (total-op 0))
+          (setq subject (format "Weekly GitHub Summary — %s to %s" mon sun))
+          (dolist (name assignees)
+            (let* ((s (org-github-dashboard--collect-all-stats name))
+                   (oi (plist-get s :open-issues))
+                   (op (plist-get s :open-prs)))
+              (cl-incf total-oi oi)
+              (cl-incf total-op op)
+              (when (> (+ oi op) 0)
+                (setq rows
+                      (concat rows
+                              (format "<li style=\"margin:3px 0;\"><strong>%s</strong> — %d open issue%s, %d open PR%s</li>"
+                                      (org-github-dashboard--html-escape name)
+                                      oi (if (= oi 1) "" "s") op (if (= op 1) "" "s")))))))
+          (setq banner-stats (list (+ total-oi total-op) 0 0))
+          (setq body
+                (concat
+                 "<h2 style=\"margin:0 0 12px;color:#24292e;\">Weekly GitHub Summary</h2>"
+                 (format "<p style=\"color:#666;margin:0 0 12px;\">%s to %s</p>" mon sun)
+                 (if (string-empty-p rows)
+                     "<p>No open items. 🎉</p>"
+                   (format "<ul style=\"list-style:none;padding:0;margin:0 0 12px;\">%s</ul>" rows))
+                 (format "<p style=\"border-top:1px solid #eee;padding-top:10px;margin-top:10px;\"><strong>Team Total</strong> — %d open issue%s, %d open PR%s</p>"
+                         total-oi (if (= total-oi 1) "" "s")
+                         total-op (if (= total-op 1) "" "s")))))
+      ;; Date-filtered summary
+      (let* ((by-assignee (org-github-dashboard--collect-discord-items repos target-date))
+             (date-label (format-time-string
+                          "%a, %b %d"
+                          (date-to-time (concat target-date "T00:00:00Z"))))
+             (sections "") (total-due 0) (total-overdue 0))
+        (setq subject (format "GitHub Tasks Due by %s" date-label))
+        (dolist (entry by-assignee)
+          (let* ((name (car entry))
+                 (items (cdr entry))
+                 (overdue (seq-filter (lambda (i) (plist-get i :overdue)) items))
+                 (due-on (seq-filter (lambda (i) (and (plist-get i :deadline)
+                                                      (not (plist-get i :overdue)))) items))
+                 (no-deadline (seq-filter (lambda (i) (null (plist-get i :deadline))) items))
+                 (item-html ""))
+            (cl-incf total-due (length items))
+            (cl-incf total-overdue (length overdue))
+            (dolist (it overdue)
+              (setq item-html (concat item-html
+                                      (org-github-dashboard--email-item-html it t nil))))
+            (dolist (it due-on)
+              (setq item-html (concat item-html
+                                      (org-github-dashboard--email-item-html it nil nil))))
+            (dolist (it no-deadline)
+              (setq item-html (concat item-html
+                                      (org-github-dashboard--email-item-html it nil nil))))
+            (setq sections
+                  (concat sections
+                          (format "<h3 style=\"margin:16px 0 4px;color:#24292e;\">%s <span style=\"font-weight:normal;color:#888;\">(%d item%s%s)</span></h3>"
+                                  (org-github-dashboard--html-escape name)
+                                  (length items) (if (= (length items) 1) "" "s")
+                                  (if overdue (format ", %d overdue" (length overdue)) ""))
+                          (format "<ul style=\"list-style:none;padding:0;margin:0;\">%s</ul>" item-html)))))
+        (when (zerop total-due)
+          (setq sections "<p>No tasks due by this date. 🎉</p>"))
+        (setq banner-stats (list total-due total-overdue 0))
+        (setq body
+              (concat
+               (format "<h2 style=\"margin:0 0 12px;color:#24292e;\">GitHub Tasks Due by %s</h2>" date-label)
+               sections
+               (format "<p style=\"border-top:1px solid #eee;padding-top:10px;margin-top:14px;\"><strong>Total: %d task%s due, %d overdue</strong></p>"
+                       total-due (if (= total-due 1) "" "s") total-overdue)))
+        ;; Completed section
+        (when since-date
+          (let* ((by-assignee-done (org-github-dashboard--collect-discord-completed repos since-date))
+                 (since-label (format-time-string
+                               "%a, %b %d"
+                               (date-to-time (concat since-date "T00:00:00Z"))))
+                 (done-sections "") (total-completed 0))
+            (dolist (entry by-assignee-done)
+              (let* ((name (car entry))
+                     (items (cdr entry))
+                     (item-html ""))
+                (cl-incf total-completed (length items))
+                (dolist (it items)
+                  (setq item-html (concat item-html
+                                          (org-github-dashboard--email-item-html it nil t))))
+                (setq done-sections
+                      (concat done-sections
+                              (format "<h3 style=\"margin:16px 0 4px;color:#24292e;\">%s <span style=\"font-weight:normal;color:#888;\">(%d completed)</span></h3>"
+                                      (org-github-dashboard--html-escape name) (length items))
+                              (format "<ul style=\"list-style:none;padding:0;margin:0;\">%s</ul>" item-html)))))
+            (setcar (nthcdr 2 banner-stats) total-completed)
+            (setq body
+                  (concat
+                   body
+                   (format "<hr style=\"border:none;border-top:1px solid #ddd;margin:20px 0;\">")
+                   (format "<h2 style=\"margin:0 0 12px;color:#24292e;\">Completed Since %s</h2>" since-label)
+                   (if (zerop total-completed)
+                       "<p>No items completed in this period.</p>"
+                     (concat done-sections
+                             (format "<p style=\"margin-top:10px;\"><strong>Total: %d completed</strong></p>"
+                                     total-completed)))))))))
+    ;; Assemble the full document with banner + footer
+    (let* ((motivation (apply #'org-github-dashboard--email-motivation banner-stats))
+           (footer (format "<p style=\"color:#999;font-size:12px;margin-top:24px;border-top:1px solid #eee;padding-top:8px;\">Repos: %s</p>"
+                           (org-github-dashboard--html-escape
+                            (string-join (or repos '("all")) ", "))))
+           (html (concat
+                  "<div style=\"font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:640px;margin:0 auto;color:#24292e;line-height:1.5;\">"
+                  (format "<div style=\"background:linear-gradient(135deg,#6e8efb,#a777e3);color:#fff;padding:16px 20px;border-radius:8px;margin-bottom:20px;\"><div style=\"font-size:15px;font-weight:600;\">✨ %s</div></div>"
+                          (org-github-dashboard--html-escape motivation))
+                  body
+                  footer
+                  "</div>")))
+      (cons subject html))))
+
+(defun org-github-dashboard--copy-html-to-clipboard (html)
+  "Put HTML on the system clipboard as a text/html flavor.
+Prefers wl-copy (Wayland), falling back to xclip (X11).  Returns the
+name of the tool used, or nil when no clipboard tool is available."
+  (let ((spec (cond
+               ((executable-find "wl-copy")
+                '("wl-copy" "wl-copy" "--type" "text/html"))
+               ((executable-find "xclip")
+                '("xclip" "xclip" "-selection" "clipboard" "-t" "text/html"))
+               (t nil))))
+    (when spec
+      (let ((proc (make-process :name (car spec)
+                                :command (cdr spec)
+                                :connection-type 'pipe
+                                :noquery t)))
+        (process-send-string proc html)
+        (process-send-eof proc))
+      (car spec))))
+
+;;;###autoload
+(defun org-github-dashboard-compose-email (target-date since-date)
+  "Render a GitHub summary email for previewing and pasting into Gmail.
+TARGET-DATE is a \"YYYY-MM-DD\" string for the due-by cutoff.
+SINCE-DATE is a \"YYYY-MM-DD\" string; completed items closed on or
+after this date are included.  Interactively, both use the Org date
+picker.  With prefix arg (C-u), builds the all-open-items weekly
+summary instead.  Prompts for repos if `org-github-dashboard-repos'
+is not set.
+
+The body is HTML (a context-aware motivational banner plus the
+summary).  Opens a rendered preview in the browser and copies the
+email's rich HTML to the clipboard as a text/html flavor, so pasting
+\(C-v) into a Gmail compose window preserves the styling.  Add To/Cc
+and send from the browser."
+  (interactive
+   (if current-prefix-arg
+       (list nil nil)
+     (list (org-read-date nil nil nil "Tasks due by: ")
+           (org-read-date nil nil nil "Completed since: "))))
+  (let* ((repos (or org-github-dashboard-repos
+                    (let ((all (org-github-dashboard--collect-repos)))
+                      (completing-read-multiple
+                       "Repos (comma-separated): " all nil t))))
+         (repo-list (if (listp repos) repos (list repos)))
+         (result (org-github-dashboard--format-email-html
+                  repo-list target-date since-date))
+         (subject (car result))
+         (html (cdr result))
+         (esc-subject (org-github-dashboard--html-escape subject))
+         (tool (org-github-dashboard--copy-html-to-clipboard html))
+         (page (concat
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                (format "<title>%s</title>" esc-subject)
+                "</head><body style=\"margin:0;padding:24px;background:#f6f8fa;\">"
+                "<div style=\"max-width:680px;margin:0 auto 16px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;\">"
+                (format "<div style=\"font-size:12px;color:#888;\">Subject</div><div style=\"font-size:16px;font-weight:600;color:#24292e;\">%s</div>"
+                        esc-subject)
+                (format "<div style=\"margin-top:8px;font-size:12px;color:%s;\">%s</div>"
+                        (if tool "#2da44e" "#c0392b")
+                        (if tool
+                            (format "Rich HTML copied to clipboard via %s — paste (C-v) into Gmail, then add To/Cc and send."
+                                    tool)
+                          "No clipboard tool found — select all (C-a) and copy (C-c) from the email below to paste into Gmail."))
+                "</div>"
+                "<div style=\"max-width:680px;margin:0 auto;background:#fff;padding:24px;border-radius:8px;border:1px solid #e1e4e8;\">"
+                html
+                "</div></body></html>"))
+         (file (make-temp-file "org-github-email-" nil ".html" page)))
+    (browse-url-of-file file)
+    (if tool
+        (message "Email ready: \"%s\" — preview opened, HTML on clipboard (%s). Paste into Gmail."
+                 subject tool)
+      (message "Email ready: \"%s\" — preview opened. Copy from the browser to paste into Gmail."
+               subject))))
+
 ;;; Mermaid Gantt Chart
 
 (defun org-github-dashboard--gantt-task-id (repo type number)
@@ -1896,6 +2216,520 @@ and optionally embeds a Mermaid Gantt chart."
       (org-mode)
       (goto-char (point-min))
       (pop-to-buffer (current-buffer)))))
+
+;;; Kanban Board View
+
+(defcustom org-github-dashboard-kanban-columns
+  '(("To Do"       ("TODO")           "gray70")
+    ("In Progress" ("NEXT")           "deep sky blue")
+    ("Waiting"     ("WAITING" "HOLD") "orange")
+    ("Done"        ("DONE")           "green3"))
+  "Columns for the kanban board view.
+Each entry is (LABEL (TODO-KEYWORD...) COLOR).  An item is placed in
+the first column whose keyword list contains its Org TODO keyword;
+items whose keyword matches no column are not shown.  COLOR is used
+for the column header and the card border.  Moving a card to a column
+sets the item's Org TODO keyword to that column's first keyword."
+  :type '(repeat (list (string :tag "Column label")
+                       (repeat (string :tag "TODO keyword"))
+                       (string :tag "Color")))
+  :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-kanban-min-card-width 18
+  "Minimum width in columns of a kanban card."
+  :type 'integer :group 'org-github-dashboard)
+
+(defcustom org-github-dashboard-kanban-max-card-width 30
+  "Maximum width in columns of a kanban card."
+  :type 'integer :group 'org-github-dashboard)
+
+(defface org-github-dashboard-kanban-number
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face for the issue/PR number on a kanban card."
+  :group 'org-github-dashboard)
+
+(defface org-github-dashboard-kanban-title
+  '((t :inherit default))
+  "Face for the title text on a kanban card."
+  :group 'org-github-dashboard)
+
+(defface org-github-dashboard-kanban-meta
+  '((t :inherit shadow))
+  "Face for the metadata line on a kanban card."
+  :group 'org-github-dashboard)
+
+(defface org-github-dashboard-kanban-highlight
+  '((t :inherit highlight :extend nil))
+  "Face highlighting the currently selected kanban card."
+  :group 'org-github-dashboard)
+
+(defvar-local org-github-dashboard--kanban-grid nil
+  "List of card geometry plists (:col :row :card :cells :pos) for navigation.")
+
+(defvar-local org-github-dashboard--kanban-cur nil
+  "The currently selected kanban grid entry.")
+
+(defvar-local org-github-dashboard--kanban-overlays nil
+  "Overlays highlighting the current kanban card.")
+
+(defvar-local org-github-dashboard--kanban-ncols 0
+  "Number of columns in the rendered kanban board.")
+
+;;;; Kanban: string helpers
+
+(defun org-github-dashboard--kanban-fit (s width)
+  "Return S truncated or space-padded to exactly WIDTH display columns."
+  (let ((w (string-width s)))
+    (cond ((= w width) s)
+          ((< w width) (concat s (make-string (- width w) ?\s)))
+          (t (truncate-string-to-width s width nil nil "…")))))
+
+(defun org-github-dashboard--kanban-wrap (text width n)
+  "Word-wrap TEXT into N lines of WIDTH columns, ellipsising overflow.
+Preserves text properties.  Returns N strings, each padded to WIDTH."
+  (let ((words (split-string text " " t)) (lines '()) (cur ""))
+    (dolist (w words)
+      (let ((cand (if (string-empty-p cur) w (concat cur " " w))))
+        (if (<= (string-width cand) width)
+            (setq cur cand)
+          (unless (string-empty-p cur) (push cur lines))
+          (if (> (string-width w) width)
+              (progn (push (truncate-string-to-width w width nil nil "…") lines)
+                     (setq cur ""))
+            (setq cur w)))))
+    (unless (string-empty-p cur) (push cur lines))
+    (setq lines (nreverse lines))
+    (let (out)
+      (dotimes (i n)
+        (let ((ln (or (nth i lines) "")))
+          (when (and (= i (1- n)) (> (length lines) n))
+            (setq ln (concat (truncate-string-to-width ln (max 0 (1- width))) "…")))
+          (push (org-github-dashboard--kanban-fit ln width) out)))
+      (nreverse out))))
+
+(defun org-github-dashboard--kanban-short (name)
+  "Shorten an assignee NAME, dropping any org suffix after the first hyphen."
+  (if (and name (string-match "\\`\\([^-]+\\)" name)) (match-string 1 name) name))
+
+(defun org-github-dashboard--kanban-meta-line (card inner)
+  "Build the metadata line for CARD fitted to INNER width."
+  (let* ((assignee (plist-get card :assignee))
+         (deadline (plist-get card :deadline))
+         (estimate (plist-get card :estimate))
+         (done (plist-get card :done))
+         (overdue (plist-get card :overdue))
+         (left (if assignee
+                   (propertize (concat "@" (org-github-dashboard--kanban-short assignee))
+                               'face 'org-github-dashboard-kanban-meta)
+                 ""))
+         (right (if done
+                    (propertize "✓" 'face '(:foreground "green3" :weight bold))
+                  (concat
+                   (if deadline
+                       (propertize (concat "⏰" (substring deadline 5))
+                                   'face (if overdue '(:foreground "red2")
+                                           'org-github-dashboard-kanban-meta))
+                     "")
+                   (if (and estimate (not (string-empty-p (string-trim estimate))))
+                       (propertize (concat " e" (string-trim estimate))
+                                   'face '(:foreground "medium purple"))
+                     "")))))
+    (let ((lw (string-width left)) (rw (string-width right)))
+      (if (>= (+ lw rw 1) inner)
+          (org-github-dashboard--kanban-fit
+           (if (string-empty-p left) right (concat left " " right)) inner)
+        (concat left (make-string (- inner lw rw) ?\s) right)))))
+
+(defun org-github-dashboard--kanban-card-lines (card width)
+  "Return a list of WIDTH-wide strings rendering CARD including borders."
+  (let* ((inner (- width 4))
+         (color (or (plist-get card :color) "gray50"))
+         (bface `(:foreground ,color))
+         (num (plist-get card :number))
+         (type (plist-get card :type))
+         (raw (replace-regexp-in-string "\\`#[0-9]+ +" "" (or (plist-get card :title) "")))
+         (head (concat (propertize (format "#%d" num) 'face 'org-github-dashboard-kanban-number)
+                       (if (eq type 'pr)
+                           (propertize " ⑂" 'face 'org-github-dashboard-kanban-meta) "")
+                       " "
+                       (propertize raw 'face 'org-github-dashboard-kanban-title)))
+         (tlines (org-github-dashboard--kanban-wrap head inner 2))
+         (meta (org-github-dashboard--kanban-meta-line card inner))
+         (lb (propertize "│ " 'face bface))
+         (rb (propertize " │" 'face bface))
+         (top (propertize (concat "┌" (make-string (- width 2) ?─) "┐") 'face bface))
+         (bot (propertize (concat "└" (make-string (- width 2) ?─) "┘") 'face bface)))
+    (list top
+          (concat lb (nth 0 tlines) rb)
+          (concat lb (nth 1 tlines) rb)
+          (concat lb meta rb)
+          bot)))
+
+;;;; Kanban: data collection
+
+(defun org-github-dashboard--kanban-collect ()
+  "Collect GitHub items as card plists, honoring the active filters."
+  (let ((today (format-time-string "%Y-%m-%d")))
+    (org-ql-select (org-agenda-files)
+      (org-github-dashboard--filtered-issue-query)
+      :action
+      (lambda ()
+        (let* ((pr (org-entry-get (point) "PR_NUMBER"))
+               (numstr (or pr (org-entry-get (point) "ISSUE_NUMBER")))
+               (done (org-entry-is-done-p))
+               (dl (org-entry-get (point) "DEADLINE"))
+               (dldate (and dl (string-match "[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}" dl)
+                            (match-string 0 dl)))
+               (assignees (org-entry-get (point) "ASSIGNEES")))
+          (list :number (string-to-number (or numstr "0"))
+                :type (if pr 'pr 'issue)
+                :title (org-get-heading t t t t)
+                :todo (org-get-todo-state)
+                :done done
+                :assignee (and assignees (car (split-string assignees "," t " +")))
+                :deadline dldate
+                :overdue (and dldate (not done) (string< dldate today))
+                :estimate (org-entry-get (point) "EFFORT")
+                :milestone (org-entry-get (point) "MILESTONE")
+                :closed (org-github-dashboard--date-from-ts
+                         (org-entry-get (point) "CLOSED_AT"))
+                :marker (copy-marker (point))))))))
+
+(defun org-github-dashboard--kanban-visible-p (card cutoff)
+  "Non-nil if CARD passes the status and period (CUTOFF) filters."
+  (let ((done (plist-get card :done)))
+    (and (pcase org-github-dashboard-status
+           ('todo (not done))
+           ('done done)
+           (_ t))
+         (or (not done) (null cutoff)
+             (let ((cl (plist-get card :closed)))
+               (and cl (not (string< cl cutoff))))))))
+
+(defun org-github-dashboard--kanban-card< (a b)
+  "Sort comparator: overdue first, then by deadline, then by number."
+  (let ((ao (plist-get a :overdue)) (bo (plist-get b :overdue))
+        (ad (plist-get a :deadline)) (bd (plist-get b :deadline)))
+    (cond ((and ao (not bo)) t)
+          ((and bo (not ao)) nil)
+          ((and ad bd (not (string= ad bd))) (string< ad bd))
+          ((and ad (not bd)) t)
+          ((and bd (not ad)) nil)
+          (t (< (plist-get a :number) (plist-get b :number))))))
+
+;;;; Kanban: rendering
+
+(defun org-github-dashboard--kanban-title-line (cards)
+  "Return the header/help text for the kanban board given visible CARDS."
+  (let* ((nopen (seq-count (lambda (c) (not (plist-get c :done))) cards))
+         (ndone (seq-count (lambda (c) (plist-get c :done)) cards))
+         (filters (string-join
+                   (delq nil
+                         (list (when org-github-dashboard-repos
+                                 (format "repos:%s" (string-join org-github-dashboard-repos ",")))
+                               (when org-github-dashboard-assignees
+                                 (format "who:%s" (string-join org-github-dashboard-assignees ",")))
+                               (when org-github-dashboard-milestones
+                                 (format "ms:%s" (string-join org-github-dashboard-milestones ",")))
+                               (unless (eq org-github-dashboard-status 'all)
+                                 (format "status:%s" org-github-dashboard-status))
+                               (when org-github-dashboard-period
+                                 (format "period:%s" (car org-github-dashboard-period)))))
+                   "  ")))
+    (concat (propertize "GitHub Kanban" 'face '(:height 1.2 :weight bold))
+            (format "   %d open · %d done" nopen ndone)
+            (if (string-empty-p filters) "" (concat "   [" filters "]"))
+            "\n"
+            (propertize
+             "RET open  s sync  M-←/→ move  ←/→/↑/↓ or h/j/k/l navigate  / filter  g refresh  v agenda  q quit"
+             'face 'shadow))))
+
+(defun org-github-dashboard--kanban-render ()
+  "Render the kanban board into the current buffer."
+  (let* ((inhibit-read-only t)
+         (columns org-github-dashboard-kanban-columns)
+         (ncols (length columns))
+         (cutoff (when org-github-dashboard-period
+                   (format-time-string
+                    "%Y-%m-%d"
+                    (time-subtract (current-time)
+                                   (days-to-time (cdr org-github-dashboard-period))))))
+         (all (seq-filter (lambda (c) (org-github-dashboard--kanban-visible-p c cutoff))
+                          (org-github-dashboard--kanban-collect)))
+         (gutter 2)
+         (gut (make-string gutter ?\s))
+         (avail (max 40 (1- (window-width))))
+         (width (max org-github-dashboard-kanban-min-card-width
+                     (min org-github-dashboard-kanban-max-card-width
+                          (/ (- avail (* gutter (1- ncols))) (max 1 ncols)))))
+         (col-cards
+          (mapcar
+           (lambda (col)
+             (let* ((kws (nth 1 col))
+                    (color (nth 2 col))
+                    (cards (sort (seq-filter
+                                  (lambda (c) (member (plist-get c :todo) kws)) all)
+                                 #'org-github-dashboard--kanban-card<)))
+               (dolist (c cards) (plist-put c :color color))
+               cards))
+           columns))
+         (maxrows (apply #'max 0 (mapcar #'length col-cards)))
+         (lines-cache (make-hash-table :test 'equal))
+         (geoms (make-hash-table :test 'equal))
+         (blank (make-string width ?\s)))
+    (erase-buffer)
+    (setq org-github-dashboard--kanban-grid nil
+          org-github-dashboard--kanban-ncols ncols)
+    (mapc #'delete-overlay org-github-dashboard--kanban-overlays)
+    (setq org-github-dashboard--kanban-overlays nil)
+    ;; Title + help
+    (insert (org-github-dashboard--kanban-title-line all) "\n\n")
+    ;; Column headers
+    (dotimes (ci ncols)
+      (let* ((col (nth ci columns))
+             (text (format " %s (%d)" (upcase (nth 0 col)) (length (nth ci col-cards)))))
+        (insert (propertize (org-github-dashboard--kanban-fit text width)
+                            'face `(:foreground ,(nth 2 col) :weight bold :underline t)))
+        (when (< ci (1- ncols)) (insert gut))))
+    (insert "\n")
+    ;; Pre-render card lines
+    (dotimes (ci ncols)
+      (let ((cards (nth ci col-cards)))
+        (dotimes (ri (length cards))
+          (puthash (cons ci ri)
+                   (org-github-dashboard--kanban-card-lines (nth ri cards) width)
+                   lines-cache))))
+    ;; Lay out cards band by band, capturing each cell's buffer region
+    (dotimes (ri maxrows)
+      (dotimes (l 5)
+        (dotimes (ci ncols)
+          (let ((lines (gethash (cons ci ri) lines-cache)))
+            (if lines
+                (let ((b (point)))
+                  (insert (propertize (nth l lines) 'org-github-card (cons ci ri)))
+                  (puthash (cons ci ri)
+                           (cons (cons b (point)) (gethash (cons ci ri) geoms))
+                           geoms))
+              (insert blank))
+            (when (< ci (1- ncols)) (insert gut))))
+        (insert "\n"))
+      (insert "\n"))
+    ;; Build the navigation grid
+    (dotimes (ci ncols)
+      (let ((cards (nth ci col-cards)))
+        (dotimes (ri (length cards))
+          (let ((cells (nreverse (gethash (cons ci ri) geoms))))
+            (push (list :col ci :row ri :card (nth ri cards)
+                        :cells cells :pos (car (car cells)))
+                  org-github-dashboard--kanban-grid)))))
+    (setq org-github-dashboard--kanban-grid (nreverse org-github-dashboard--kanban-grid))
+    (goto-char (point-min))))
+
+;;;; Kanban: navigation
+
+(defun org-github-dashboard--kanban-entry (col row)
+  "Return the grid entry at COL and ROW, or nil."
+  (seq-find (lambda (e) (and (= (plist-get e :col) col) (= (plist-get e :row) row)))
+            org-github-dashboard--kanban-grid))
+
+(defun org-github-dashboard--kanban-nearest (col row)
+  "Return the card entry in COL nearest to ROW, or nil."
+  (let ((es (seq-filter (lambda (e) (= (plist-get e :col) col))
+                        org-github-dashboard--kanban-grid)))
+    (when es
+      (car (sort es (lambda (a b)
+                      (< (abs (- (plist-get a :row) row))
+                         (abs (- (plist-get b :row) row)))))))))
+
+(defun org-github-dashboard--kanban-current ()
+  "Return the currently selected grid entry."
+  (or (let ((c (get-text-property (point) 'org-github-card)))
+        (and c (org-github-dashboard--kanban-entry (car c) (cdr c))))
+      org-github-dashboard--kanban-cur
+      (car org-github-dashboard--kanban-grid)))
+
+(defun org-github-dashboard--kanban-highlight (entry)
+  "Highlight the card ENTRY with overlays."
+  (mapc #'delete-overlay org-github-dashboard--kanban-overlays)
+  (setq org-github-dashboard--kanban-overlays nil)
+  (dolist (cell (plist-get entry :cells))
+    (let ((ov (make-overlay (car cell) (cdr cell))))
+      (overlay-put ov 'face 'org-github-dashboard-kanban-highlight)
+      (overlay-put ov 'priority 100)
+      (push ov org-github-dashboard--kanban-overlays))))
+
+(defun org-github-dashboard--kanban-goto (entry)
+  "Select grid ENTRY: move point to it and highlight it."
+  (when entry
+    (setq org-github-dashboard--kanban-cur entry)
+    (goto-char (plist-get entry :pos))
+    (org-github-dashboard--kanban-highlight entry)))
+
+(defun org-github-dashboard-kanban-right ()
+  "Move selection to the nearest card in the next non-empty column."
+  (interactive)
+  (let* ((cur (org-github-dashboard--kanban-current))
+         (col (plist-get cur :col)) (row (plist-get cur :row)) target)
+    (cl-loop for c from (1+ col) below org-github-dashboard--kanban-ncols
+             do (when (setq target (org-github-dashboard--kanban-nearest c row))
+                  (cl-return)))
+    (org-github-dashboard--kanban-goto (or target cur))))
+
+(defun org-github-dashboard-kanban-left ()
+  "Move selection to the nearest card in the previous non-empty column."
+  (interactive)
+  (let* ((cur (org-github-dashboard--kanban-current))
+         (col (plist-get cur :col)) (row (plist-get cur :row)) target)
+    (cl-loop for c from (1- col) downto 0
+             do (when (setq target (org-github-dashboard--kanban-nearest c row))
+                  (cl-return)))
+    (org-github-dashboard--kanban-goto (or target cur))))
+
+(defun org-github-dashboard-kanban-down ()
+  "Move selection to the next card down in the current column."
+  (interactive)
+  (let* ((cur (org-github-dashboard--kanban-current))
+         (target (org-github-dashboard--kanban-entry
+                  (plist-get cur :col) (1+ (plist-get cur :row)))))
+    (when target (org-github-dashboard--kanban-goto target))))
+
+(defun org-github-dashboard-kanban-up ()
+  "Move selection to the previous card up in the current column."
+  (interactive)
+  (let* ((cur (org-github-dashboard--kanban-current))
+         (target (org-github-dashboard--kanban-entry
+                  (plist-get cur :col) (1- (plist-get cur :row)))))
+    (when target (org-github-dashboard--kanban-goto target))))
+
+;;;; Kanban: actions
+
+(defun org-github-dashboard-kanban-open ()
+  "Jump to the Org heading for the card at point."
+  (interactive)
+  (let* ((cur (org-github-dashboard--kanban-current))
+         (m (plist-get (plist-get cur :card) :marker)))
+    (if (and m (marker-buffer m))
+        (progn
+          (pop-to-buffer (marker-buffer m))
+          (goto-char m)
+          (org-back-to-heading t)
+          (cond ((fboundp 'org-fold-show-entry) (org-fold-show-entry))
+                ((fboundp 'org-show-entry) (org-show-entry))))
+      (message "No source location for this card"))))
+
+(defun org-github-dashboard-kanban-sync ()
+  "Sync the card at point from GitHub, then refresh the board.
+With a prefix argument, force-pull; with two, force-push."
+  (interactive)
+  (let* ((cur (org-github-dashboard--kanban-current))
+         (m (plist-get (plist-get cur :card) :marker))
+         (buf (current-buffer)))
+    (if (and m (marker-buffer m))
+        (with-current-buffer (marker-buffer m)
+          (save-excursion
+            (goto-char m)
+            (org-github-sync-at-point-async
+             current-prefix-arg
+             (lambda (_err)
+               (when (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (org-github-dashboard-kanban-refresh)))))))
+      (message "No source location for this card"))))
+
+(defun org-github-dashboard-kanban-move (dir)
+  "Move the current card to the adjacent column (DIR -1 left, +1 right).
+Sets the item's Org TODO keyword to that column's first keyword.  When
+`org-github-mode' is active, that state change propagates to GitHub."
+  (let* ((cur (org-github-dashboard--kanban-current))
+         (target-col (+ (plist-get cur :col) dir))
+         (card (plist-get cur :card))
+         (m (plist-get card :marker)))
+    (cond
+     ((or (< target-col 0) (>= target-col org-github-dashboard--kanban-ncols))
+      (message "No column in that direction"))
+     ((not (and m (marker-buffer m))) (message "No source location for this card"))
+     (t
+      (let ((kw (car (nth 1 (nth target-col org-github-dashboard-kanban-columns)))))
+        (with-current-buffer (marker-buffer m)
+          (save-excursion
+            (goto-char m)
+            (let ((org-blocker-hook nil))
+              (org-todo kw))
+            (save-buffer)))
+        (message "Moved #%d → %s" (plist-get card :number)
+                 (nth 0 (nth target-col org-github-dashboard-kanban-columns)))
+        (org-github-dashboard-kanban-refresh))))))
+
+(defun org-github-dashboard-kanban-move-right ()
+  "Move the current card one column to the right."
+  (interactive) (org-github-dashboard-kanban-move 1))
+
+(defun org-github-dashboard-kanban-move-left ()
+  "Move the current card one column to the left."
+  (interactive) (org-github-dashboard-kanban-move -1))
+
+(defun org-github-dashboard-kanban-refresh ()
+  "Re-render the kanban board, preserving the selected card if possible."
+  (interactive)
+  (let ((num (and org-github-dashboard--kanban-cur
+                  (plist-get (plist-get org-github-dashboard--kanban-cur :card) :number))))
+    (org-github-dashboard--kanban-render)
+    (org-github-dashboard--kanban-goto
+     (or (and num (seq-find (lambda (e)
+                              (= (plist-get (plist-get e :card) :number) num))
+                            org-github-dashboard--kanban-grid))
+         (car org-github-dashboard--kanban-grid)))))
+
+;;;; Kanban: mode and entry point
+
+(defvar org-github-dashboard-kanban-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET")       #'org-github-dashboard-kanban-open)
+    (define-key map (kbd "<right>")   #'org-github-dashboard-kanban-right)
+    (define-key map (kbd "<left>")    #'org-github-dashboard-kanban-left)
+    (define-key map (kbd "<up>")      #'org-github-dashboard-kanban-up)
+    (define-key map (kbd "<down>")    #'org-github-dashboard-kanban-down)
+    (define-key map "l" #'org-github-dashboard-kanban-right)
+    (define-key map "h" #'org-github-dashboard-kanban-left)
+    (define-key map "j" #'org-github-dashboard-kanban-down)
+    (define-key map "k" #'org-github-dashboard-kanban-up)
+    (define-key map "n" #'org-github-dashboard-kanban-down)
+    (define-key map "p" #'org-github-dashboard-kanban-up)
+    (define-key map (kbd "M-<right>") #'org-github-dashboard-kanban-move-right)
+    (define-key map (kbd "M-<left>")  #'org-github-dashboard-kanban-move-left)
+    (define-key map "L" #'org-github-dashboard-kanban-move-right)
+    (define-key map "H" #'org-github-dashboard-kanban-move-left)
+    (define-key map "s" #'org-github-dashboard-kanban-sync)
+    (define-key map "g" #'org-github-dashboard-kanban-refresh)
+    (define-key map "/" #'org-github-dashboard-toggle-filter)
+    (define-key map "v" #'org-github-dashboard)
+    (define-key map "a" #'org-github-dashboard)
+    (define-key map "q" #'quit-window)
+    map)
+  "Keymap for `org-github-dashboard-kanban-mode'.")
+
+(define-derived-mode org-github-dashboard-kanban-mode special-mode "GH-Kanban"
+  "Major mode for the org-github horizontal kanban board."
+  (setq truncate-lines t)
+  (setq-local cursor-type nil)
+  (buffer-disable-undo))
+
+;;;###autoload
+(defun org-github-dashboard-kanban ()
+  "Show GitHub issues/PRs as a horizontal kanban board, by Org TODO state.
+Columns come from `org-github-dashboard-kanban-columns' and honor the
+same repo/assignee/milestone/status/period filters as the agenda
+dashboard (press \\`/' to change them)."
+  (interactive)
+  (let ((buf (get-buffer-create "*GitHub Kanban*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'org-github-dashboard-kanban-mode)
+        (org-github-dashboard-kanban-mode))
+      (org-github-dashboard--kanban-render)
+      (when org-github-dashboard--kanban-grid
+        (org-github-dashboard--kanban-goto (car org-github-dashboard--kanban-grid))))
+    (pop-to-buffer buf)
+    (delete-other-windows)))
 
 (provide 'org-github-dashboard)
 
