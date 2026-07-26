@@ -181,10 +181,45 @@ built on =org-ql= and =org-super-agenda=.
 
 *** Dashboard Keybindings
 
-| Key | Action                                   |
-|-----+------------------------------------------|
-| =/=   | Filter by repos, assignees, status, period |
-| =S=   | Sync the item at point from GitHub       |
+| Key       | Action                                     |
+|-----------+--------------------------------------------|
+| =/=         | Filter by repos, assignees, status, period |
+| =S=         | Sync the item at point from GitHub         |
+| =k=         | Open the horizontal Kanban board           |
+| =C-d=       | Set the deadline of the item at point      |
+| =V d/w/m/a= | Switch view to day / week / month / all    |
+| =TAB=       | Fold / unfold the section at point         |
+| =S-TAB=     | Cycle folding of all sections              |
+
+In addition, the whole =s-z H= GitHub menu is available inside the
+dashboard (and other =org-agenda= buffers), not just =s-z H P=. The
+prefix mirrors the global GitHub hydra, with =P= bound to the
+dashboard-aware "sync item at point":
+
+| Key       | Action                              |
+|-----------+-------------------------------------|
+| =s-z H i=   | Download issues                     |
+| =s-z H p=   | Download PRs                        |
+| =s-z H a=   | Download all (new only)             |
+| =s-z H s=   | Full sync (single repo)             |
+| =s-z H S=   | Sync all repos                      |
+| =s-z H P=   | Sync the dashboard item at point    |
+| =s-z H <=   | Pull the item at point              |
+| =s-z H >=   | Push the item at point              |
+| =s-z H c=   | Clock in                            |
+| =s-z H C=   | Clock out and log                   |
+| =s-z H v=   | View issue                          |
+| =s-z H b=   | Open in browser                     |
+| =s-z H x=   | Close issue                         |
+| =s-z H m=   | Add comment                         |
+| =s-z H n=   | Create issue                        |
+| =s-z H t=   | Extract time from git               |
+| =s-z H e=   | Estimate time from commits          |
+| =s-z H k=   | Open the Kanban board               |
+| =s-z H d=   | Open the team dashboard             |
+
+This prefix is provided by the =org-github-dashboard-github-prefix-map=
+keymap, which the dashboard binds locally when it renders.
 
 *** Configuration
 

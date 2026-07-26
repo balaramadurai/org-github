@@ -1094,6 +1094,35 @@ If point is not on a block header line, fall back to
       (goto-char (point-min)))
     (display-buffer buf)))
 
+(defvar org-github-dashboard-github-prefix-map
+  (let ((map (make-sparse-keymap)))
+    ;; Mirror the global `s-z H' GitHub menu so the whole prefix works
+    ;; inside agenda/dashboard buffers, not just `s-z H P'.  Keys match
+    ;; the github hydra; `P' is overridden to the dashboard-aware sync.
+    (define-key map "i" #'org-github-download-issues)
+    (define-key map "p" #'org-github-download-prs)
+    (define-key map "a" #'org-github-download-all)
+    (define-key map "s" #'org-github-full-sync)
+    (define-key map "S" #'org-github-sync-repos)
+    (define-key map "c" #'org-github-clock-in)
+    (define-key map "C" #'org-github-clock-out-and-log)
+    (define-key map "v" #'org-github-view-issue)
+    (define-key map "b" #'org-github-open-in-browser)
+    (define-key map "x" #'org-github-close-issue)
+    (define-key map "m" #'org-github-add-comment)
+    (define-key map "n" #'org-github-create-issue)
+    (define-key map "P" #'org-github-dashboard-sync-item)
+    (define-key map "<" #'org-github-pull-at-point)
+    (define-key map ">" #'org-github-push-at-point)
+    (define-key map "t" #'org-github-extract-time-from-git)
+    (define-key map "e" #'org-github-estimate-time-from-commits)
+    (define-key map "k" #'org-github-dashboard-kanban)
+    (define-key map "d" #'org-github-dashboard)
+    map)
+  "Keymap for the `s-z H' GitHub prefix inside dashboard/agenda buffers.
+Bound locally by `org-github-dashboard--run' so the full GitHub menu is
+reachable from the dashboard, mirroring the global `s-z H' hydra.")
+
 (defun org-github-dashboard--run (&rest _)
   "Agenda function: build dynamic blocks and run as composite agenda."
   (let* ((blocks (org-github-dashboard--build-blocks)))
@@ -1108,7 +1137,7 @@ If point is not on a block header line, fall back to
     (local-set-key (kbd "/") #'org-github-dashboard-toggle-filter)
     (local-set-key (kbd "k") #'org-github-dashboard-kanban)
     (local-set-key (kbd "S") #'org-github-dashboard-sync-item)
-    (local-set-key (kbd "s-z H P") #'org-github-dashboard-sync-item)
+    (local-set-key (kbd "s-z H") org-github-dashboard-github-prefix-map)
     (local-set-key (kbd "C-d") #'org-github-dashboard-set-deadline)
     (local-set-key (kbd "V d") #'org-github-dashboard-view-day)
     (local-set-key (kbd "V w") #'org-github-dashboard-view-week)
