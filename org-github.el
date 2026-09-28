@@ -97,6 +97,15 @@ Example:
   :type 'integer
   :group 'org-github)
 
+(defcustom org-github-prompt-closing-note t
+  "Prompt for an optional closing note when closing an item on GitHub.
+Only per-item commands ask: marking a linked heading DONE by hand, and
+the at-point sync/push commands.  Bulk commands
+\(`org-github-full-sync', `org-github-sync-repos' and the state-sync
+commands they call) never prompt."
+  :type 'boolean
+  :group 'org-github)
+
 (defcustom org-github-issue-todo-state "TODO"
   "TODO state for open issues."
   :type 'string
@@ -154,9 +163,29 @@ Each value is (FETCH-TIME . DEADLINES-ALIST).")
 (defvar org-github--owner-type-cache (make-hash-table :test 'equal)
   "Cache mapping an owner login to \"User\" or \"Organization\".")
 
+(defvar org-github--issue-fields-cache (make-hash-table :test 'equal)
+  "Cache of an Organization's Issue Fields, keyed by owner login.
+Value is an alist of (FIELD-NAME . FIELD-ID), or the symbol `none' when
+OWNER is not an Organization or has no Issue Fields configured.")
+
+(defvar org-github--issue-date-fields-cache (make-hash-table :test 'equal)
+  "Cache for Organization Issue Field \"Deadline\"/\"Start date\" data, keyed
+by repo string.  Each value is (FETCH-TIME . DATE-FIELDS-ALIST), mirroring
+`org-github--project-deadlines-cache'.")
+
 (defvar org-github--active-syncs (make-hash-table :test 'equal)
   "Hash table of (REPO . NUM-STR) keys for syncs currently in progress.
 Prevents duplicate concurrent async syncs for the same item.")
+
+;; NOTE: this must be declared special *before* the first `let' that binds it
+;; (`org-github--pull-at-point' and the bulk state-sync commands below).  With
+;; `lexical-binding' those bindings compile to plain lexical variables when the
+;; byte-compiler hasn't seen the `defvar' yet, so the global value stays nil and
+;; `org-github--on-todo-state-change' fires mid-sync -- prompting for a closing
+;; note on every issue a bulk sync marks DONE.
+(defvar org-github--syncing nil
+  "Non-nil when a GitHub→Org sync is in progress.
+Suppresses the todo-state-change hook to prevent feedback loops.")
 
 (defun org-github--gh-available-p ()
   "Check if gh CLI is available."
@@ -238,10 +267,13 @@ STATE can be \"open\", \"closed\", \"merged\", or \"all\" (default)."
     (org-github--parse-json json-output)))
 
 (defun org-github-clear-project-deadlines-cache ()
-  "Clear cached GitHub Projects V2 deadline data for all repos."
+  "Clear cached GitHub Projects V2 and Organization Issue Field
+\"Deadline\"/\"Start date\" data."
   (interactive)
   (clrhash org-github--project-deadlines-cache)
   (clrhash org-github--owner-type-cache)
+  (clrhash org-github--issue-fields-cache)
+  (clrhash org-github--issue-date-fields-cache)
   (message "org-github: project deadlines cache cleared"))
 
 (defun org-github--owner-type (owner)
@@ -357,6 +389,175 @@ for `org-github-project-deadlines-cache-ttl' seconds."
                      repo)
             deadlines))))))
 
+(defun org-github--org-issue-fields (owner)
+  "Return alist of (FIELD-NAME . FIELD-ID) for OWNER's Organization Issue
+Fields (github.com/organizations/OWNER/settings/issue-fields), cached.
+Returns nil when OWNER is not an Organization -- Issue Fields are an
+Organization-only feature, unlike Projects V2 which also works for Users
+-- or the Organization has none configured."
+  (let ((cached (gethash owner org-github--issue-fields-cache 'org-github--miss)))
+    (if (not (eq cached 'org-github--miss))
+        (unless (eq cached 'none) cached)
+      (let ((fields
+             (when (string= (org-github--owner-type owner) "Organization")
+               (let* ((query (format "{
+  organization(login: \"%s\") {
+    issueFields(first: 50) {
+      nodes {
+        __typename
+        ... on IssueFieldDate { id name }
+        ... on IssueFieldText { id name }
+        ... on IssueFieldNumber { id name }
+        ... on IssueFieldSingleSelect { id name }
+        ... on IssueFieldMultiSelect { id name }
+      }
+    }
+  }
+}" owner))
+                      (json-output (org-github--run-gh-sync
+                                    (list "api" "graphql" "-f" (concat "query=" query))))
+                      (data (org-github--parse-json json-output))
+                      (nodes (alist-get 'nodes
+                                        (alist-get 'issueFields
+                                                   (alist-get 'organization
+                                                              (alist-get 'data data))))))
+                 (mapcar (lambda (n) (cons (alist-get 'name n) (alist-get 'id n))) nodes)))))
+        (puthash owner (or fields 'none) org-github--issue-fields-cache)
+        fields))))
+
+(defun org-github--issue-field-id (owner field-name)
+  "Return the Organization Issue Field id for FIELD-NAME under OWNER, or nil."
+  (cdr (assoc field-name (org-github--org-issue-fields owner))))
+
+(defun org-github--fetch-issue-date-fields (repo)
+  "Fetch the Organization \"Deadline\" and \"Start date\" Issue Field
+values for every issue in REPO.  Returns a list of (ISSUE-NUMBER DEADLINE
+START-DATE); DEADLINE and START-DATE are \"YYYY-MM-DD\" strings, or nil
+when that field is unset for that issue.  Returns nil when REPO's owner
+is not an Organization, or the Organization has neither a \"Deadline\"
+nor a \"Start date\" Issue Field configured.  This reads the fields shown
+on an issue under \"Fields\" (org-wide, independent of any Projects V2
+board) -- see `org-github--fetch-project-deadlines' for the older,
+board-scoped \"Deadline\" field this supersedes for issues.  Issue Fields
+do not exist on PullRequest, so PR deadlines still come from the
+Projects V2 board.  Results are cached for
+`org-github-project-deadlines-cache-ttl' seconds."
+  (let* ((entry (gethash repo org-github--issue-date-fields-cache))
+         (fetch-time (car entry))
+         (cached-fields (cdr entry)))
+    (if (and (> org-github-project-deadlines-cache-ttl 0)
+             fetch-time
+             (< (float-time (time-subtract (current-time) fetch-time))
+                org-github-project-deadlines-cache-ttl))
+        cached-fields
+      (let* ((parts (split-string repo "/"))
+             (owner (car parts))
+             (repo-name (cadr parts)))
+        (when (or (org-github--issue-field-id owner "Deadline")
+                  (org-github--issue-field-id owner "Start date"))
+          (let ((date-fields '())
+                (has-next t)
+                (cursor nil))
+            (while has-next
+              (let* ((after-clause (if cursor (format "after: \"%s\"" cursor) ""))
+                     (query (format "{
+  repository(owner: \"%s\", name: \"%s\") {
+    issues(first: 100 %s) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        issueFieldValues(first: 10) {
+          nodes {
+            __typename
+            ... on IssueFieldDateValue {
+              value
+              field { ... on IssueFieldDate { name } }
+            }
+          }
+        }
+      }
+    }
+  }
+}" owner repo-name after-clause))
+                     (json-output (org-github--run-gh-sync
+                                   (list "api" "graphql" "-f" (concat "query=" query))))
+                     (data (org-github--parse-json json-output))
+                     (issues (alist-get 'issues
+                                        (alist-get 'repository (alist-get 'data data))))
+                     (page-info (alist-get 'pageInfo issues))
+                     (nodes (alist-get 'nodes issues)))
+                (dolist (node nodes)
+                  (let* ((number (alist-get 'number node))
+                         (field-values (alist-get 'nodes (alist-get 'issueFieldValues node)))
+                         (deadline (cl-loop for fv in field-values
+                                            for fname = (alist-get 'name (alist-get 'field fv))
+                                            when (and fname (string= fname "Deadline"))
+                                            return (alist-get 'value fv)))
+                         (start-date (cl-loop for fv in field-values
+                                              for fname = (alist-get 'name (alist-get 'field fv))
+                                              when (and fname (string= fname "Start date"))
+                                              return (alist-get 'value fv))))
+                    (push (list number deadline start-date) date-fields)))
+                (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+                (setq cursor (alist-get 'endCursor page-info))))
+            (when (> org-github-project-deadlines-cache-ttl 0)
+              (puthash repo (cons (current-time) date-fields)
+                       org-github--issue-date-fields-cache))
+            (message "Fetched %d issue Deadline/Start-date fields (%d deadlines, %d start dates) for %s"
+                     (length date-fields)
+                     (seq-count #'cadr date-fields)
+                     (seq-count #'caddr date-fields)
+                     repo)
+            date-fields))))))
+
+(defun org-github--fetch-issue-deadlines (repo)
+  "Fetch the Organization \"Deadline\" Issue Field value for every issue in
+REPO.  Returns an alist of (ISSUE-NUMBER . DATE-OR-NIL); DATE-OR-NIL is a
+\"YYYY-MM-DD\" string, or nil when the field is unset for that issue.
+Thin wrapper around `org-github--fetch-issue-date-fields' preserving the
+original return shape for existing callers."
+  (mapcar (lambda (c) (cons (car c) (cadr c)))
+          (org-github--fetch-issue-date-fields repo)))
+
+(defun org-github--fetch-issue-start-dates (repo)
+  "Fetch the Organization \"Start date\" Issue Field value for every issue
+in REPO.  Returns an alist of (ISSUE-NUMBER . DATE-OR-NIL); DATE-OR-NIL is
+a \"YYYY-MM-DD\" string, or nil when the field is unset for that issue.
+See `org-github--fetch-issue-date-fields' for details."
+  (mapcar (lambda (c) (cons (car c) (caddr c)))
+          (org-github--fetch-issue-date-fields repo)))
+
+(defun org-github--parse-body-deadline (body)
+  "Parse a \"Due:\" or \"Deadline:\" line from issue/PR BODY text.
+Returns a \"YYYY-MM-DD\" date string, or nil when BODY is nil or has no
+matching line.  Matching is case-insensitive and anchored to the start
+of a line (optional leading whitespace).  A body-parsed deadline takes
+priority over the Projects V2 \"Deadline\" field, since it's the more
+immediate, per-item source of truth the author controls directly."
+  (when body
+    (let ((case-fold-search t))
+      (when (string-match "^[ \t]*\\(?:Due\\|Deadline\\):[ \t]*\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)" body)
+        (match-string 1 body)))))
+
+(defun org-github--resolve-deadline (body-deadline project-deadline)
+  "Resolve deadline from multiple sources.
+BODY-DEADLINE is parsed from the issue/PR body; PROJECT-DEADLINE from
+GitHub Projects V2.  Issue-level deadline wins conflicts."
+  (or body-deadline project-deadline))
+
+(defun org-github--resolve-managed-deadline (issue-cell project-cell)
+  "Combine an Organization Issue Field cell and a Projects V2 board cell.
+ISSUE-CELL is (NUMBER . DATE-OR-NIL) from `org-github--fetch-issue-deadlines'
+or nil when unavailable (PR, non-Organization owner, or no \"Deadline\"
+Issue Field configured).  PROJECT-CELL is (NUMBER DATE ESTIMATE) from
+`org-github--fetch-project-deadlines' or nil when the item isn't board-
+managed.  Returns (DEADLINE . CLEAR-DEADLINE): the Issue Field wins when
+present, falling back to the board field; CLEAR-DEADLINE is non-nil when
+whichever managed source applies has the field explicitly unset."
+  (cons (if issue-cell (cdr issue-cell) (cadr project-cell))
+        (or (and issue-cell (null (cdr issue-cell)))
+            (and project-cell (null (cadr project-cell))))))
+
 (defun org-github--format-estimate (n)
   "Format project Estimate number N as a string for the EFFORT property.
 Whole numbers are rendered without a decimal point.  Returns nil for N nil."
@@ -389,6 +590,7 @@ If ISSUE contains a `deadline' key, it is added as an Org DEADLINE."
          (assignees (mapcar (lambda (a) (alist-get 'login a)) (alist-get 'assignees issue)))
          (milestone (alist-get 'title (alist-get 'milestone issue)))
          (deadline (alist-get 'deadline issue))
+         (scheduled (alist-get 'scheduled issue))
          (effort (alist-get 'effort issue))
          (todo-state (org-github--state-to-todo state 'issue))
          (tags (if labels (concat ":" (string-join labels ":") ":") ""))
@@ -397,10 +599,20 @@ If ISSUE contains a `deadline' key, it is added as an Org DEADLINE."
      (format "*** %s #%d %s" todo-state number title)
      (if (string-empty-p tags) "" (format " %s" tags))
      "\n"
-     (if deadline
-         (format "DEADLINE: <%s>\n"
-                 (format-time-string "%Y-%m-%d %a"
-                                     (date-to-time (concat deadline "T00:00:00Z"))))
+     (if (or deadline scheduled)
+         (concat
+          (string-join
+           (delq nil
+                 (list (when deadline
+                         (format "DEADLINE: <%s>"
+                                 (format-time-string "%Y-%m-%d %a"
+                                                     (date-to-time (concat deadline "T00:00:00Z")))))
+                       (when scheduled
+                         (format "SCHEDULED: <%s>"
+                                 (format-time-string "%Y-%m-%d %a"
+                                                     (date-to-time (concat scheduled "T00:00:00Z")))))))
+           " ")
+          "\n")
        "")
      ":PROPERTIES:\n"
      (format ":ISSUE_NUMBER: %d\n" number)
@@ -601,15 +813,19 @@ Uses `org-github-repo-file-alist' to determine file and parent heading."
 
 ;;; State Synchronization
 
-(defun org-github--update-issue-state (repo number github-state &optional deadline issue clear-deadline estimate clear-estimate)
+(defun org-github--update-issue-state (repo number github-state &optional deadline issue clear-deadline estimate clear-estimate scheduled clear-scheduled)
   "Update org-mode TODO state for issue NUMBER from REPO based on GITHUB-STATE.
-Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects.
+Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects, or from
+a body-parsed \"Due:\"/\"Deadline:\" line, which takes priority when present.
 Optional ISSUE is the full issue alist for updating metadata like assignees.
 When CLEAR-DEADLINE is non-nil and DEADLINE is nil, remove any existing
 Org DEADLINE (the item is on the board but its Deadline was cleared).
 Optional ESTIMATE is the project board Estimate value (a string) stored as
 the EFFORT property; when CLEAR-ESTIMATE is non-nil and ESTIMATE is nil,
-remove any existing EFFORT property."
+remove any existing EFFORT property.
+Optional SCHEDULED is a \"YYYY-MM-DD\" string from the Organization
+\"Start date\" Issue Field.  When CLEAR-SCHEDULED is non-nil and
+SCHEDULED is nil, remove any existing Org SCHEDULED."
   (let ((pos (org-github--find-issue-heading repo number))
         (org-file (org-github--get-repo-file repo)))
     (when pos
@@ -642,7 +858,15 @@ remove any existing EFFORT property."
                 ;; actively) and leave STATE updated but the TODO keyword
                 ;; stale -- or pop a `yes-or-no-p' mid bulk sync.
                 (let ((org-blocker-hook nil))
-                  (org-todo new-todo)))
+                  (org-todo new-todo))
+                ;; If issue is closed and we have the closedAt timestamp, use it
+                ;; for the CLOSED: timestamp instead of the current time
+                (when (and issue
+                           (string= new-todo org-github-closed-state)
+                           (alist-get 'closedAt issue))
+                  (org-back-to-heading t)
+                  (org-add-planning-info 'closed
+                                         (date-to-time (alist-get 'closedAt issue)))))
               (setq changed t))
             ;; Sync DEADLINE: set when the board has one, clear when it was removed
             (org-back-to-heading t)
@@ -655,6 +879,18 @@ remove any existing EFFORT property."
                   (setq changed t))))
              ((and clear-deadline (org-entry-get (point) "DEADLINE"))
               (org-deadline '(4))
+              (setq changed t)))
+            ;; Sync SCHEDULED from the Organization "Start date" Issue Field
+            (org-back-to-heading t)
+            (cond
+             (scheduled
+              (let ((sch-str (format-time-string "<%Y-%m-%d %a>"
+                                                 (date-to-time (concat scheduled "T00:00:00Z")))))
+                (unless (string= (or (org-entry-get (point) "SCHEDULED") "") sch-str)
+                  (org-schedule nil sch-str)
+                  (setq changed t))))
+             ((and clear-scheduled (org-entry-get (point) "SCHEDULED"))
+              (org-schedule '(4))
               (setq changed t)))
             ;; Sync EFFORT from the project board Estimate field
             (org-back-to-heading t)
@@ -728,7 +964,8 @@ remove any existing EFFORT property."
   "Update org-mode TODO state for PR NUMBER from REPO.
 Uses GITHUB-STATE and MERGED timestamp to determine final state.
 Optional PR is the full PR alist for updating timestamps.
-Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects.
+Optional DEADLINE is a \"YYYY-MM-DD\" string from GitHub Projects, or from
+a body-parsed \"Due:\"/\"Deadline:\" line, which takes priority when present.
 When CLEAR-DEADLINE is non-nil and DEADLINE is nil, remove any existing
 Org DEADLINE (the item is on the board but its Deadline was cleared).
 Optional ESTIMATE is the project board Estimate value (a string) stored as
@@ -759,6 +996,16 @@ remove any existing EFFORT property."
               ;; Bypass `org-blocker-hook' (see `org-github--update-issue-state').
               (let ((org-blocker-hook nil))
                 (org-todo new-todo))
+              ;; If PR is closed/merged and we have the closedAt/mergedAt timestamp,
+              ;; use it for the CLOSED: timestamp instead of the current time
+              (when (and pr
+                         (or (string= new-todo org-github-pr-closed-state)
+                             (string= new-todo org-github-pr-merged-state)))
+                (let ((close-time (or (and merged merged)
+                                      (alist-get 'closedAt pr))))
+                  (when close-time
+                    (org-back-to-heading t)
+                    (org-add-planning-info 'closed (date-to-time close-time)))))
               (setq changed t))
             ;; Sync metadata from full PR data
             (when pr
@@ -844,11 +1091,12 @@ remove any existing EFFORT property."
 
 (defun org-github--fetch-single-issue (repo number)
   "Fetch a single issue NUMBER from REPO via gh CLI.
-Returns the parsed alist or nil on failure."
+Returns the parsed alist or nil on failure.  Includes the GraphQL node
+ID (\"id\"), needed to push an Organization Issue Field value."
   (let ((json-output (org-github--run-gh-sync
                       (list "issue" "view" (number-to-string number)
                             "-R" repo
-                            "--json" "number,title,body,state,createdAt,updatedAt,closedAt,labels,assignees,milestone,url,author"))))
+                            "--json" "id,number,title,body,state,createdAt,updatedAt,closedAt,labels,assignees,milestone,url,author"))))
     (org-github--parse-json json-output)))
 
 (defun org-github--fetch-single-pr (repo number)
@@ -884,26 +1132,49 @@ Returns a time value for comparison, or 0 epoch if nil/unparseable."
   "Pull remote data for TYPE item NUM in REPO into org heading at point.
 NUM must be an integer.  REMOTE-DATA is the parsed alist from GitHub.
 Updates the heading in place using the existing update functions.
-When REPO has a project configured, the item's board Deadline is pulled
-too: set when present, or cleared from the org heading when removed."
+For issues, the Deadline comes from the Organization Issue Field when
+configured, falling back to the Projects V2 board field otherwise (PRs
+always use the board field, since Issue Fields don't apply to them):
+set when present, or cleared from the org heading when removed."
   (let* ((org-github--syncing t)
          (cell (when (assoc repo org-github-repo-project-alist)
                  (assq num (org-github--fetch-project-deadlines repo))))
-         (deadline (cadr cell))
-         (clear-deadline (and cell (null deadline)))
+         (issue-cell (when (string= type "issue")
+                       (assq num (org-github--fetch-issue-deadlines repo))))
+         (start-cell (when (string= type "issue")
+                       (assq num (org-github--fetch-issue-start-dates repo))))
+         (managed (org-github--resolve-managed-deadline issue-cell cell))
+         (body-deadline (org-github--parse-body-deadline
+                         (alist-get 'body remote-data)))
+         (deadline (org-github--resolve-deadline body-deadline (car managed)))
+         (clear-deadline (cdr managed))
+         (scheduled (cdr start-cell))
+         (clear-scheduled (and start-cell (null (cdr start-cell))))
          (estimate (org-github--format-estimate (caddr cell)))
          (clear-estimate (and cell (null estimate))))
     (if (string= type "issue")
         (let ((github-state (alist-get 'state remote-data)))
           (org-github--update-issue-state repo num
                                           (downcase github-state) deadline remote-data
-                                          clear-deadline estimate clear-estimate))
+                                          clear-deadline estimate clear-estimate
+                                          scheduled clear-scheduled))
       ;; PR
       (let ((github-state (alist-get 'state remote-data))
             (merged (alist-get 'mergedAt remote-data)))
         (org-github--update-pr-state repo num
                                      (downcase github-state) merged remote-data deadline
                                      clear-deadline estimate clear-estimate)))))
+
+(defun org-github--read-closing-note (num)
+  "Prompt for an optional closing note for item NUM.
+Returns the trimmed note, or nil when the user leaves it empty or
+`org-github-prompt-closing-note' is nil.  Callers must be per-item
+commands: bulk sync runs unattended and must never block on this."
+  (when org-github-prompt-closing-note
+    (let ((note (string-trim
+                 (read-string
+                  (format "Closing note for #%s (empty to skip): " num)))))
+      (unless (string-empty-p note) note))))
 
 (defun org-github--push-at-point (repo num type &optional remote-data)
   "Push local org heading state to GitHub for TYPE item NUM in REPO.
@@ -931,6 +1202,9 @@ REMOTE-DATA, if provided, is used to skip pushes when values are unchanged."
     ;; --- 1. Push state (close/reopen) ---
     (cond
      ((and local-closed (not stored-closed))
+      (when-let* ((note (org-github--read-closing-note num)))
+        (org-github--run-gh-sync (list type "comment" num "-R" repo "-b" note))
+        (push "closing-note" changes))
       (org-github--run-gh-sync (list type "close" num "-R" repo))
       (org-set-property "STATE" "closed")
       (org-set-property "UPDATED_AT"
@@ -975,10 +1249,19 @@ REMOTE-DATA, if provided, is used to skip pushes when values are unchanged."
       ;; Single gh call for all edit fields
       (org-github--run-gh-sync edit-args))
 
-    ;; --- 4. Push deadline to GitHub Projects V2 ---
+    ;; --- 4. Push deadline: Organization Issue Field for issues (Issue
+    ;; Fields don't apply to PRs, which still use the Projects V2 board) ---
     (when deadline-str
-      (org-github--push-deadline-at-point repo (string-to-number num) deadline-str)
+      (if (string= type "issue")
+          (org-github--push-issue-deadline-at-point repo (alist-get 'id remote-data) deadline-str)
+        (org-github--push-deadline-at-point repo (string-to-number num) deadline-str))
       (push "deadline" changes))
+
+    ;; --- 5. Push SCHEDULED: Organization "Start date" Issue Field (issues only) ---
+    (when (and (string= type "issue") (org-entry-get (point) "SCHEDULED"))
+      (org-github--push-issue-start-date-at-point
+       repo (alist-get 'id remote-data) (org-entry-get (point) "SCHEDULED"))
+      (push "start-date" changes))
 
     changes))
 
@@ -1078,18 +1361,32 @@ Posts local state, title, assignees, labels, milestone, and deadline."
 
 (defun org-github--push-deadline-at-point (repo number deadline-str)
   "Push DEADLINE-STR to GitHub Projects V2 for issue NUMBER in REPO.
-Requires a project mapping in `org-github-repo-project-alist'."
+Requires a project mapping in `org-github-repo-project-alist'.  Queries
+the `organization' or `user' GraphQL root as appropriate (see
+`org-github--owner-type') and paginates through project items to find
+NUMBER, since large boards exceed a single page."
   (let ((project-config (cdr (assoc repo org-github-repo-project-alist))))
     (when project-config
       (let* ((owner (car project-config))
              (project-num (cdr project-config))
-             ;; Need project/field/item IDs from GraphQL (metadata, not issue content)
-             (query (format "{
-  user(login: \"%s\") {
+             (root-field (if (string= (org-github--owner-type owner) "Organization")
+                             "organization"
+                           "user"))
+             (project-id nil)
+             (field-id nil)
+             (item-id nil)
+             (has-next t)
+             (cursor nil))
+        (while (and has-next (not item-id))
+          (let* ((after-clause (if cursor (format "after: \"%s\"" cursor) ""))
+                 ;; Need project/field/item IDs from GraphQL (metadata, not issue content)
+                 (query (format "{
+  %s(login: \"%s\") {
     projectV2(number: %d) {
       id
       field(name: \"Deadline\") { ... on ProjectV2SingleSelectField { id } ... on ProjectV2Field { id } }
-      items(first: 100) {
+      items(first: 100 %s) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           content { ... on Issue { number repository { nameWithOwner } } }
@@ -1097,43 +1394,97 @@ Requires a project mapping in `org-github-repo-project-alist'."
       }
     }
   }
-}" owner project-num))
-             (json-output (org-github--run-gh-sync
-                           (list "api" "graphql" "-f" (concat "query=" query))))
-             (data (org-github--parse-json json-output))
-             (project-data (alist-get 'projectV2
-                                       (alist-get 'user
-                                                   (alist-get 'data data))))
-             (project-id (alist-get 'id project-data))
-             (field-id (alist-get 'id (alist-get 'field project-data)))
-             (items (alist-get 'nodes (alist-get 'items project-data)))
-             (item-id (cl-loop for item in items
-                               when (let ((content (alist-get 'content item)))
-                                      (and (= (alist-get 'number content) number)
-                                           (string= (alist-get 'nameWithOwner
-                                                                (alist-get 'repository content))
-                                                    repo)))
-                               return (alist-get 'id item))))
-        (when (and project-id field-id item-id)
-          (let ((date (format-time-string "%Y-%m-%d"
-                                          (org-time-string-to-time deadline-str))))
-            (org-github--run-gh-sync
-             (list "project" "item-edit"
-                   "--id" item-id
-                   "--project-id" project-id
-                   "--field-id" field-id
-                   "--date" date))))))))
+}" root-field owner project-num after-clause))
+                 (json-output (org-github--run-gh-sync
+                               (list "api" "graphql" "-f" (concat "query=" query))))
+                 (data (org-github--parse-json json-output))
+                 (project-data (alist-get 'projectV2
+                                           (alist-get (intern root-field)
+                                                      (alist-get 'data data))))
+                 (items (alist-get 'items project-data))
+                 (page-info (alist-get 'pageInfo items))
+                 (nodes (alist-get 'nodes items)))
+            (setq project-id (or project-id (alist-get 'id project-data)))
+            (setq field-id (or field-id (alist-get 'id (alist-get 'field project-data))))
+            (setq item-id (cl-loop for item in nodes
+                                   when (let ((content (alist-get 'content item)))
+                                          (and content
+                                               (= (alist-get 'number content) number)
+                                               (string= (alist-get 'nameWithOwner
+                                                                    (alist-get 'repository content))
+                                                        repo)))
+                                   return (alist-get 'id item)))
+            (setq has-next (eq (alist-get 'hasNextPage page-info) t))
+            (setq cursor (alist-get 'endCursor page-info))))
+        (if (and project-id field-id item-id)
+            (let ((date (format-time-string "%Y-%m-%d"
+                                            (org-time-string-to-time deadline-str))))
+              (org-github--run-gh-sync
+               (list "project" "item-edit"
+                     "--id" item-id
+                     "--project-id" project-id
+                     "--field-id" field-id
+                     "--date" date)))
+          (message "org-github: could not push deadline for %s #%d (project-id=%s field-id=%s item-id=%s)"
+                   repo number (and project-id t) (and field-id t) (and item-id t)))))))
+
+(defun org-github--push-issue-deadline-at-point (repo issue-node-id deadline-str)
+  "Push DEADLINE-STR to the Organization \"Deadline\" Issue Field
+(github.com/organizations/OWNER/settings/issue-fields) for the issue
+identified by ISSUE-NODE-ID in REPO.  No-ops (with a diagnostic message)
+when REPO's owner is not an Organization, has no \"Deadline\" Issue Field
+configured, or ISSUE-NODE-ID is unavailable."
+  (let* ((owner (car (split-string repo "/")))
+         (field-id (org-github--issue-field-id owner "Deadline")))
+    (if (and issue-node-id field-id)
+        (let* ((date (format-time-string "%Y-%m-%d"
+                                         (org-time-string-to-time deadline-str)))
+               (mutation (format "mutation {
+  setIssueFieldValue(input: {issueId: \"%s\", issueFields: [{fieldId: \"%s\", dateValue: \"%s\"}]}) {
+    clientMutationId
+  }
+}" issue-node-id field-id date)))
+          (org-github--run-gh-sync
+           (list "api" "graphql" "-f" (concat "query=" mutation))))
+      (message "org-github: could not push issue Deadline field for %s (issue-id=%s field-id=%s)"
+               repo (and issue-node-id t) (and field-id t)))))
+
+(defun org-github--push-issue-start-date-at-point (repo issue-node-id scheduled-str)
+  "Push SCHEDULED-STR to the Organization \"Start date\" Issue Field
+(github.com/organizations/OWNER/settings/issue-fields) for the issue
+identified by ISSUE-NODE-ID in REPO.  No-ops (with a diagnostic message)
+when REPO's owner is not an Organization, has no \"Start date\" Issue
+Field configured, or ISSUE-NODE-ID is unavailable."
+  (let* ((owner (car (split-string repo "/")))
+         (field-id (org-github--issue-field-id owner "Start date")))
+    (if (and issue-node-id field-id)
+        (let* ((date (format-time-string "%Y-%m-%d"
+                                         (org-time-string-to-time scheduled-str)))
+               (mutation (format "mutation {
+  setIssueFieldValue(input: {issueId: \"%s\", issueFields: [{fieldId: \"%s\", dateValue: \"%s\"}]}) {
+    clientMutationId
+  }
+}" issue-node-id field-id date)))
+          (org-github--run-gh-sync
+           (list "api" "graphql" "-f" (concat "query=" mutation))))
+      (message "org-github: could not push issue Start date field for %s (issue-id=%s field-id=%s)"
+               repo (and issue-node-id t) (and field-id t)))))
 
 ;;;###autoload
 (defun org-github-sync-issue-states (&optional repo)
   "Sync org-mode states with GitHub for all issues in REPO.
-Updates existing issues and adds new ones.  When a project mapping
-exists in `org-github-repo-project-alist', also syncs deadlines."
+Updates existing issues and adds new ones.  Syncs deadlines from a
+body-parsed \"Due:\"/\"Deadline:\" line when present, falling back to the
+Organization \"Deadline\" Issue Field when configured, then to the
+GitHub Projects V2 \"Deadline\" field when a project mapping exists in
+`org-github-repo-project-alist'."
   (interactive)
   (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
                                       nil nil nil nil (car org-github-default-repos))))
          (issues (org-github--fetch-issues repo "all"))
          (deadlines (org-github--fetch-project-deadlines repo))
+         (issue-deadlines (org-github--fetch-issue-deadlines repo))
+         (start-dates (org-github--fetch-issue-start-dates repo))
          (org-file (org-github--get-repo-file repo))
          (org-github--syncing t)
          (updated-count 0)
@@ -1151,18 +1502,28 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
               (let* ((number (alist-get 'number issue))
                      (state (alist-get 'state issue))
                      (cell (assq number deadlines))
-                     (deadline (cadr cell))
-                     (clear-deadline (and cell (null deadline)))
+                     (issue-cell (assq number issue-deadlines))
+                     (start-cell (assq number start-dates))
+                     (managed (org-github--resolve-managed-deadline issue-cell cell))
+                     (deadline (org-github--resolve-deadline
+                                (org-github--parse-body-deadline (alist-get 'body issue))
+                                (car managed)))
+                     (clear-deadline (cdr managed))
+                     (scheduled (cdr start-cell))
+                     (clear-scheduled (and start-cell (null (cdr start-cell))))
                      (estimate (org-github--format-estimate (caddr cell)))
                      (clear-estimate (and cell (null estimate))))
                 (if (org-github--issue-exists-p repo number)
                     (when (org-github--update-issue-state repo number state deadline issue
-                                                          clear-deadline estimate clear-estimate)
+                                                          clear-deadline estimate clear-estimate
+                                                          scheduled clear-scheduled)
                       (setq updated-count (1+ updated-count)))
                   (goto-char (org-github--find-or-create-repo-heading repo))
-                  ;; Inject deadline + estimate into issue data for formatting
+                  ;; Inject deadline + scheduled + estimate into issue data for formatting
                   (when deadline
                     (push (cons 'deadline deadline) issue))
+                  (when scheduled
+                    (push (cons 'scheduled scheduled) issue))
                   (when estimate
                     (push (cons 'effort estimate) issue))
                   (insert (org-github--issue-to-org issue repo))
@@ -1180,8 +1541,10 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
 ;;;###autoload
 (defun org-github-sync-pr-states (&optional repo)
   "Sync org-mode states with GitHub for all PRs in REPO.
-Updates existing PRs and adds new ones.  When a project mapping
-exists in `org-github-repo-project-alist', also syncs deadlines."
+Updates existing PRs and adds new ones.  Syncs deadlines from a
+body-parsed \"Due:\"/\"Deadline:\" line when present, falling back to
+the GitHub Projects V2 \"Deadline\" field when a project mapping exists
+in `org-github-repo-project-alist'."
   (interactive)
   (let* ((repo (or repo (completing-read "Repository: " org-github-default-repos
                                       nil nil nil nil (car org-github-default-repos))))
@@ -1203,7 +1566,9 @@ exists in `org-github-repo-project-alist', also syncs deadlines."
                      (state (alist-get 'state pr))
                      (merged (alist-get 'mergedAt pr))
                      (cell (assq number deadlines))
-                     (deadline (cadr cell))
+                     (deadline (org-github--resolve-deadline
+                                (org-github--parse-body-deadline (alist-get 'body pr))
+                                (cadr cell)))
                      (clear-deadline (and cell (null deadline)))
                      (estimate (org-github--format-estimate (caddr cell)))
                      (clear-estimate (and cell (null estimate))))
@@ -1565,10 +1930,6 @@ ones, call `org-github-download-issues' / `-download-prs' directly."
 
 ;;; Bidirectional Sync (Org → GitHub)
 
-(defvar org-github--syncing nil
-  "Non-nil when a GitHub→Org sync is in progress.
-Suppresses the todo-state-change hook to prevent feedback loops.")
-
 (defun org-github--on-todo-state-change ()
   "Hook for `org-after-todo-state-change-hook'.
 When a GitHub-linked heading is marked DONE, close the issue on
@@ -1581,11 +1942,10 @@ Suppressed during sync operations."
       (cond
        ;; Marked as DONE → close on GitHub
        ((string= new-state org-github-closed-state)
-        (let* ((comment (read-string
-                         (format "Closing note for #%s (empty to skip): " issue-num)))
+        (let* ((comment (org-github--read-closing-note issue-num))
                (marker (point-marker))
                (calls (append
-                       (unless (string-empty-p comment)
+                       (when comment
                          (list (list "issue" "comment" issue-num "-R" repo "-b" comment)))
                        (list (list "issue" "close" issue-num "-R" repo)))))
           (condition-case err
@@ -1604,7 +1964,7 @@ Suppressed during sync operations."
                          (org-set-property "UPDATED_AT"
                                            (format-time-string "[%Y-%m-%d %a %H:%M]")))))
                    (message "Closed #%s on GitHub%s" issue-num
-                            (if (string-empty-p comment) "" " (with comment)")))))
+                            (if comment " (with comment)" "")))))
             (error (message "Failed to close issue: %s" (error-message-string err))))))
        ;; Reopened (back to TODO/NEXT from DONE) → reopen on GitHub
        ((and (member new-state (cons org-github-issue-todo-state
@@ -1796,6 +2156,24 @@ CALLBACK receives nil on success or an error string."
                           "--date" date)
                     (lambda (_out err) (funcall callback err)))))))))))))
 
+(defun org-github--push-issue-start-date-async (repo issue-node-id scheduled-str callback)
+  "Async version of `org-github--push-issue-start-date-at-point'.
+CALLBACK receives nil on success or an error string."
+  (let* ((owner (car (split-string repo "/")))
+         (field-id (org-github--issue-field-id owner "Start date")))
+    (if (not (and issue-node-id field-id))
+        (funcall callback nil)
+      (let* ((date (format-time-string "%Y-%m-%d"
+                                       (org-time-string-to-time scheduled-str)))
+             (mutation (format "mutation {
+  setIssueFieldValue(input: {issueId: \"%s\", issueFields: [{fieldId: \"%s\", dateValue: \"%s\"}]}) {
+    clientMutationId
+  }
+}" issue-node-id field-id date)))
+        (org-github--run-gh-async
+         (list "api" "graphql" "-f" (concat "query=" mutation))
+         (lambda (_out err) (funcall callback err)))))))
+
 (defun org-github--collect-push-ops (repo num-str type remote-data)
   "Collect push operations for the GitHub item heading at point.
 Returns a plist:
@@ -1811,6 +2189,8 @@ Returns a plist:
                   heading))
          (remote-title (when remote-data (alist-get 'title remote-data)))
          (deadline-str (org-entry-get (point) "DEADLINE"))
+         (issue-id (and (string= type "issue") (alist-get 'id remote-data)))
+         (scheduled-str (org-entry-get (point) "SCHEDULED"))
          (milestone (org-entry-get (point) "MILESTONE"))
          (assignees-str (org-entry-get (point) "ASSIGNEES"))
          (github-labels-str (org-entry-get (point) "GITHUB_LABELS"))
@@ -1828,6 +2208,9 @@ Returns a plist:
     ;; --- State change ---
     (cond
      ((and local-closed (not stored-closed))
+      (when-let* ((note (org-github--read-closing-note num-str)))
+        (push (list type "comment" num-str "-R" repo "-b" note) calls)
+        (push "closing-note" changes))
       (push (list type "close" num-str "-R" repo) calls)
       (push "state→closed" changes)
       (push (cons "STATE" "closed") post-props)
@@ -1868,10 +2251,17 @@ Returns a plist:
       (setq post-deadline-args (list repo (string-to-number num-str) deadline-str))
       (push "deadline" changes))
 
+    ;; --- Start date (Organization "Start date" Issue Field, issues only) ---
+    (when (and (string= type "issue") scheduled-str)
+      (push "start-date" changes))
+
     (list :calls (nreverse calls)
           :post-fn
           (let ((props (nreverse post-props))
-                (dl-args post-deadline-args))
+                (dl-args post-deadline-args)
+                (repo repo)
+                (issue-id issue-id)
+                (scheduled-str scheduled-str))
             (lambda (done-cb)
               (when (and (markerp pos-marker)
                          (buffer-live-p (marker-buffer pos-marker)))
@@ -1884,14 +2274,23 @@ Returns a plist:
                         (if (eq (cdr pair) :delete)
                             (org-delete-property (car pair))
                           (org-set-property (car pair) (cdr pair))))))))
-              (if dl-args
-                  (apply #'org-github--push-deadline-async
-                         (append dl-args
-                                 (list (lambda (err)
-                                         (when err
-                                           (message "org-github: deadline push failed: %s" err))
-                                         (funcall done-cb nil)))))
-                (funcall done-cb nil))))
+              (cl-flet ((finish-with-start-date (cb)
+                          (if (and issue-id scheduled-str)
+                              (org-github--push-issue-start-date-async
+                               repo issue-id scheduled-str
+                               (lambda (err)
+                                 (when err
+                                   (message "org-github: start-date push failed: %s" err))
+                                 (funcall cb nil)))
+                            (funcall cb nil))))
+                (if dl-args
+                    (apply #'org-github--push-deadline-async
+                           (append dl-args
+                                   (list (lambda (err)
+                                           (when err
+                                             (message "org-github: deadline push failed: %s" err))
+                                           (finish-with-start-date done-cb)))))
+                  (finish-with-start-date done-cb)))))
           :changes (nreverse changes))))
 
 ;;;###autoload
@@ -1920,7 +2319,7 @@ DONE-CALLBACK is called with nil on success or an error string on failure."
                   (list "pr" "view" num-str "-R" repo
                         "--json" "number,title,body,state,createdAt,updatedAt,closedAt,mergedAt,labels,assignees,milestone,url,author,headRefName,baseRefName")
                 (list "issue" "view" num-str "-R" repo
-                      "--json" "number,title,body,state,createdAt,updatedAt,closedAt,labels,assignees,milestone,url,author"))))
+                      "--json" "id,number,title,body,state,createdAt,updatedAt,closedAt,labels,assignees,milestone,url,author"))))
         (if (gethash sync-key org-github--active-syncs)
             (progn
               (message "org-github: %s #%s is already syncing" type num-str)
